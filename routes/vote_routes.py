@@ -32,6 +32,10 @@ def get_results():
 @router.get("/chains")
 def get_chains():
     return blockchain.get_all_chains()
+@router.get("/structure")
+def get_merkle_structure():
+    return blockchain.get_merkle_structure()
+
 @router.get("/candidates")
 def list_candidates():
     return {"candidates": get_all_candidates()}
