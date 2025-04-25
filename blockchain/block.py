@@ -32,21 +32,49 @@ class Block:
             "candidate": self.candidate,
             "hash": self.hash
         }
+class NationalBlock:
+    def __init__(self, region_hashes: dict):
+        self.timestamp = int(time.time())
+        self.region_hashes = region_hashes  # {Marmara: hash1, Ege: hash2, ...}
+        self.merkle_root = self.compute_merkle_root()
 
+    def compute_merkle_root(self):
+        import hashlib
+
+        def hash_pair(a, b):
+            combined = (a + b).encode('utf-8')
+            return hashlib.sha256(combined).hexdigest()
+
+        hashes = list(self.region_hashes.values())
+        if not hashes:
+            return ""
+
+        while len(hashes) > 1:
+            if len(hashes) % 2 == 1:
+                hashes.append(hashes[-1])  # son elemanı çiftlemek
+            hashes = [hash_pair(hashes[i], hashes[i + 1]) for i in range(0, len(hashes), 2)]
+
+        return hashes[0]  # Merkle kökü
 class RegionalBlockchain:
     def __init__(self, region_name: str):
         self.region_name = region_name
-        self.chain: List[Block] = []
+        self.chain = []
         self.vote_counts = {}
-        self.create_genesis_block()
+        self.load_chain_from_db()
+        if not self.chain:
+            self.create_genesis_block()
 
     def create_genesis_block(self):
-        genesis = Block(0, "0", int(time.time()), "Genesis", "Genesis", self.calculate_hash(0, "0", "Genesis", "Genesis"))
+        genesis = Block(
+            0, "0", int(time.time()), "Genesis", "Genesis",
+            self.calculate_hash(0, "0", "Genesis", "Genesis")
+        )
         self.chain.append(genesis)
         self.save_block_to_db(genesis)
+        self.vote_counts["Genesis"] = 0  # varsayılan
 
     def calculate_hash(self, index, previous_hash, voter_id_hash, candidate):
-        value = f"{index}{previous_hash}{voter_id_hash}{candidate}"
+        value = f"{index}{previous_hash}{voter_id_hash}{candidate}{self.region_name}"
         new_hash = hashlib.sha256(value.encode()).hexdigest()
         return new_hash
 
@@ -103,7 +131,7 @@ class RegionalBlockchain:
         cursor = conn.cursor()
 
         cursor.execute('''
-            SELECT BlockIndex, PreviousHash, Timestamp, VoterID_Hashed, Candidate, Hash
+            SELECT BlockIndex, PreviousHash, Timestamp, VoterID_Hashed, Hash
             FROM Blocks
             WHERE Region = ?
             ORDER BY BlockIndex ASC
@@ -118,11 +146,44 @@ class RegionalBlockchain:
                 "previous_hash": row["PreviousHash"],
                 "timestamp": row["Timestamp"],
                 "voter_id_hash": row["VoterID_Hashed"],
-                "candidate": row["Candidate"],
                 "hash": row["Hash"]
             }
             for row in rows
         ]
+
+    def load_chain_from_db(self):
+        from db.connection import get_db_connection
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute('''
+            SELECT BlockIndex, PreviousHash, Timestamp, VoterID_Hashed, Candidate, Hash
+            FROM Blocks
+            WHERE Region = ?
+            ORDER BY BlockIndex ASC
+        ''', (self.region_name,))
+        rows = cursor.fetchall()
+
+        self.chain = [
+            Block(
+                index=row["BlockIndex"],
+                previous_hash=row["PreviousHash"],
+                timestamp=row["Timestamp"],
+                voter_id_hash=row["VoterID_Hashed"],
+                candidate=row["Candidate"],
+                hash=row["Hash"]
+            )
+            for row in rows
+        ]
+
+        # vote_counts da sıfırlanmasın
+        self.vote_counts = {}
+        for block in self.chain:
+            if block.candidate != "Genesis":
+                self.vote_counts[block.candidate] = self.vote_counts.get(block.candidate, 0) + 1
+
+        conn.close()
 
     def save_block_to_db(self, block: Block):
         conn = get_db_connection()
@@ -139,6 +200,58 @@ class RegionalBlockchain:
 class MainBlockchain:
     def __init__(self):
         self.regions = {region: RegionalBlockchain(region) for region in REGIONS}
+        self.create_national_block()
+
+    def create_national_block(self):
+        from db.connection import get_db_connection
+        import hashlib
+
+        region_hashes = {}
+        for region_name, region_chain in self.regions.items():
+            blocks = region_chain.get_chain()
+            if blocks:
+                region_hashes[region_name] = blocks[-1]["hash"]
+
+        def hash_pair(a, b):
+            return hashlib.sha256((a + b).encode()).hexdigest()
+
+        hashes = list(region_hashes.values())
+        if not hashes:
+            return None
+
+        while len(hashes) > 1:
+            if len(hashes) % 2 == 1:
+                hashes.append(hashes[-1])
+            hashes = [hash_pair(hashes[i], hashes[i + 1]) for i in range(0, len(hashes), 2)]
+
+        merkle_root = hashes[0]
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Zaten eklenmişse tekrar ekleme
+        cursor.execute("SELECT 1 FROM Blocks WHERE Region = 'Ulusal' AND BlockIndex = 0")
+        if cursor.fetchone():
+            conn.close()
+            return merkle_root
+
+        cursor.execute('''
+            INSERT INTO Blocks (Region, BlockIndex, PreviousHash, Timestamp, VoterID_Hashed, Candidate, Hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            "Ulusal",
+            0,
+            "-",
+            int(time.time()),
+            "-",
+            "MerkleRoot",
+            merkle_root
+        ))
+
+        conn.commit()
+        conn.close()
+
+        return merkle_root
 
     def vote(self, region: str, voter_id: str, candidate: str):
         if region not in self.regions:
@@ -152,9 +265,37 @@ class MainBlockchain:
         return results
 
     def get_all_chains(self):
-        return {
-            region: chain.get_chain() for region, chain in self.regions.items()
-        }
+        from db.connection import get_db_connection
+
+        chains = {}
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        for region in self.regions.keys():
+            cursor.execute('''
+                SELECT BlockIndex, PreviousHash, Timestamp, VoterID_Hashed, Candidate, Hash
+                FROM Blocks
+                WHERE Region = ?
+                ORDER BY BlockIndex ASC
+            ''', (region,))
+            rows = cursor.fetchall()
+
+            blocks = [
+                {
+                    "index": row["BlockIndex"],
+                    "previous_hash": row["PreviousHash"],
+                    "timestamp": row["Timestamp"],
+                    "voter_id_hash": row["VoterID_Hashed"],
+                    "candidate": row["Candidate"],
+                    "hash": row["Hash"]
+                }
+                for row in rows
+            ]
+
+            chains[region] = blocks
+
+        conn.close()
+        return chains
 
     def get_merkle_structure(self):
         from db.connection import get_db_connection
@@ -191,7 +332,6 @@ class MainBlockchain:
                 for row in rows
             ]
 
-            # Zincirde blok varsa en son bloğun hash'ini al
             if blocks:
                 region_hashes[region_name] = blocks[-1]["hash"]
 
@@ -202,18 +342,16 @@ class MainBlockchain:
 
         conn.close()
 
-        # Merkle root hesapla
         def compute_merkle_root(hashes):
             if not hashes:
                 return ""
 
             def hash_pair(a, b):
-                combined = (a + b).encode('utf-8')
-                return hashlib.sha256(combined).hexdigest()
+                return hashlib.sha256((a + b).encode('utf-8')).hexdigest()
 
             while len(hashes) > 1:
                 if len(hashes) % 2 == 1:
-                    hashes.append(hashes[-1])  # son elemanı çiftle
+                    hashes.append(hashes[-1])
                 hashes = [hash_pair(hashes[i], hashes[i + 1]) for i in range(0, len(hashes), 2)]
             return hashes[0]
 
@@ -231,26 +369,4 @@ class MainBlockchain:
 
         return NationalBlock(region_hashes)
 
-class NationalBlock:
-    def __init__(self, region_hashes: dict):
-        self.timestamp = int(time.time())
-        self.region_hashes = region_hashes  # {Marmara: hash1, Ege: hash2, ...}
-        self.merkle_root = self.compute_merkle_root()
 
-    def compute_merkle_root(self):
-        import hashlib
-
-        def hash_pair(a, b):
-            combined = (a + b).encode('utf-8')
-            return hashlib.sha256(combined).hexdigest()
-
-        hashes = list(self.region_hashes.values())
-        if not hashes:
-            return ""
-
-        while len(hashes) > 1:
-            if len(hashes) % 2 == 1:
-                hashes.append(hashes[-1])  # son elemanı çiftlemek
-            hashes = [hash_pair(hashes[i], hashes[i + 1]) for i in range(0, len(hashes), 2)]
-
-        return hashes[0]  # Merkle kökü

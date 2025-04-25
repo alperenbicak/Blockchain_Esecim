@@ -1,4 +1,51 @@
 from db.connection import get_db_connection
+import hashlib
+from collections import defaultdict
+
+def calculate_expected_hash(index, previous_hash, voter_id_hash, candidate, region):
+    raw = f"{index}{previous_hash}{voter_id_hash}{candidate}{region}"
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+def get_verified_vote_results():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        SELECT Region, BlockIndex, PreviousHash, Timestamp, VoterID_Hashed, Candidate, Hash
+        FROM Blocks
+        WHERE BlockIndex != 0 AND Candidate != 'MerkleRoot'
+        ORDER BY Region, BlockIndex ASC
+    ''')
+    rows = cursor.fetchall()
+    conn.close()
+
+    results = defaultdict(int)
+    invalid_blocks = []
+
+    for row in rows:
+        expected_hash = calculate_expected_hash(
+            row["BlockIndex"],
+            row["PreviousHash"],
+            row["VoterID_Hashed"],
+            row["Candidate"],
+            row["Region"]
+        )
+
+        if expected_hash == row["Hash"]:
+            results[row["Candidate"]] += 1
+        else:
+            invalid_blocks.append({
+                "region": row["Region"],
+                "index": row["BlockIndex"],
+                "candidate": row["Candidate"],
+                "hash_in_db": row["Hash"],
+                "expected_hash": expected_hash
+            })
+
+    return {
+        "verified_results": dict(results),
+        "invalid_blocks": invalid_blocks
+    }
 
 # Kullanıcıyı veritabanına ekle
 def create_voter(tc: str, full_name: str, region: str, hashed_password: str):

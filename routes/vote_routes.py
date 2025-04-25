@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from auth.jwt_handler import get_current_voter
 from blockchain.block import MainBlockchain
-
+from db.crud_voters import get_verified_vote_results
 router = APIRouter()
 blockchain = MainBlockchain()
 
@@ -39,3 +39,7 @@ def get_merkle_structure():
 @router.get("/candidates")
 def list_candidates():
     return {"candidates": get_all_candidates()}
+
+@router.get("/results/verified")
+def get_verified_results():
+    return get_verified_vote_results()
