@@ -106,6 +106,26 @@ class RegionalBlockchain:
 
         conn.commit()
         conn.close()
+        conn2 = get_db_connection()
+        cur2 = conn2.cursor()
+
+        # A) Bölge root’larını oku
+        cur2.execute("SELECT MerkleRoot FROM RegionRoots ORDER BY Region")
+        roots = [r["MerkleRoot"] for r in cur2.fetchall()]
+
+        # B) Ulusal Merkle root’u hesapla
+        national_root = calculate_merkle_root(roots)
+        now = int(time.time())
+
+        # C) Upsert NationalRoots tablosuna
+        cur2.execute("""
+          UPDATE NationalRoots
+             SET MerkleRoot = ?, UpdatedAt = ?
+           WHERE Id = 0
+        """, (national_root, now))
+
+        conn2.commit()
+        conn2.close()
     def load_chain_from_db(self):
         conn = get_db_connection()
         cur = conn.cursor()
@@ -182,47 +202,51 @@ class MainBlockchain:
         return {r: rb.get_chain() for r, rb in self.regions.items()}
 
     def get_merkle_structure(self) -> dict:
-        structure = {"root": "Ulusal Seçim Zinciri", "children": [], "merkle_root": ""}
-
         conn = get_db_connection()
         cur = conn.cursor()
 
-        # 1) Bölge blokları ve kökleri
-        region_roots = []
+        structure = {
+            "root": "Ulusal Seçim Zinciri",
+            "children": [],
+            "stored_merkle_root": "",
+            "live_merkle_root": "",
+            "regions": []
+        }
+
+        # 1) RegionRoots tablosundan kayıtlı kökler
+        cur.execute("SELECT Region, MerkleRoot, UpdatedAt FROM RegionRoots")
+        reg_rows = cur.fetchall()
+        stored_region_roots = {r["Region"]: r["MerkleRoot"] for r in reg_rows}
+
+        # 2) Blocks’dan canlı hash listesiyle yeniden hesapla
+        live_region_roots = {}
         for region in REGIONS:
-            # A) Bölge zincir bütünlüğünü kontrol et (isteğe bağlı)
-            cur.execute("SELECT BlockIndex, PreviousHash, Timestamp, VoterID_Hashed, Candidate, Hash FROM Blocks WHERE Region = ? ORDER BY BlockIndex", (region,))
-            rows = cur.fetchall()
-            blocks = []
-            for r in rows:
-                blocks.append({
-                    "index": r["BlockIndex"],
-                    "previous_hash": r["PreviousHash"],
-                    "timestamp": r["Timestamp"],
-                    "voter_id_hash": r["VoterID_Hashed"],
-                    "candidate": r["Candidate"],
-                    "hash": r["Hash"],  # lowercase key
-                })
-            ok = validate_chain(blocks, region)
+            cur.execute(
+                "SELECT Hash FROM Blocks WHERE Region = ? ORDER BY BlockIndex",
+                (region,)
+            )
+            hashes = [r["Hash"] for r in cur.fetchall()]
+            live_region_roots[region] = calculate_merkle_root(hashes)
 
-            # B) Bölge Merkle root’unu RegionRoots’tan al
-            cur.execute("SELECT MerkleRoot, UpdatedAt FROM RegionRoots WHERE Region = ?", (region,))
-            root_row = cur.fetchone()
-            region_root = root_row["MerkleRoot"] if root_row else ""
-
-            entry = {
+            structure["regions"].append({
                 "region": region,
-                "status": "OK" if ok else "BROKEN",
-                "blocks": blocks,
-                "merkle_root": region_root,
-                "updated_at": root_row["UpdatedAt"] if root_row else None
-            }
-            structure["children"].append(entry)
-            if ok and region_root:
-                region_roots.append(region_root)
+                "stored_root": stored_region_roots.get(region, ""),
+                "live_root": live_region_roots[region],
+                "match": stored_region_roots.get(region, "") == live_region_roots[region]
+            })
 
-        # 2) Ulusal Merkle root — bölge köklerini kullan
-        structure["merkle_root"] = calculate_merkle_root(region_roots)
+        # 3) Ulusal kayıtlı root
+        cur.execute("SELECT MerkleRoot, UpdatedAt FROM NationalRoots WHERE Id = 0")
+        nat_row = cur.fetchone()
+        structure["stored_merkle_root"] = nat_row["MerkleRoot"]
+
+        # 4) Ulusal canlı root
+        structure["live_merkle_root"] = calculate_merkle_root(
+            list(live_region_roots.values())
+        )
+        structure["match"] = (
+                structure["stored_merkle_root"] == structure["live_merkle_root"]
+        )
 
         conn.close()
         return structure
