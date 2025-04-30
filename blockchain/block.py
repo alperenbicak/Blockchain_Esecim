@@ -1,21 +1,17 @@
-# blockchain/block.py
 import hashlib
 import time
-from typing import List
+from typing import List, Dict
 from db.connection import get_db_connection
+from blockchain.utils import validate_chain, calculate_merkle_root
 
 REGIONS = [
-    "Marmara",
-    "Ege",
-    "Akdeniz",
-    "Iç Anadolu",
-    "Karadeniz",
-    "Doğu Anadolu",
-    "Güneydoğu Anadolu"
+    "Marmara", "Ege", "Akdeniz", "Iç Anadolu",
+    "Karadeniz", "Doğu Anadolu", "Güneydoğu Anadolu"
 ]
 
 class Block:
-    def __init__(self, index: int, previous_hash: str, timestamp: int, voter_id_hash: str, candidate: str, hash: str):
+    def __init__(self, index: int, previous_hash: str, timestamp: int,
+                 voter_id_hash: str, candidate: str, hash: str):
         self.index = index
         self.previous_hash = previous_hash
         self.timestamp = timestamp
@@ -23,7 +19,7 @@ class Block:
         self.candidate = candidate
         self.hash = hash
 
-    def to_dict(self):
+    def to_dict(self) -> Dict:
         return {
             "index": self.index,
             "previous_hash": self.previous_hash,
@@ -32,341 +28,201 @@ class Block:
             "candidate": self.candidate,
             "hash": self.hash
         }
-class NationalBlock:
-    def __init__(self, region_hashes: dict):
-        self.timestamp = int(time.time())
-        self.region_hashes = region_hashes  # {Marmara: hash1, Ege: hash2, ...}
-        self.merkle_root = self.compute_merkle_root()
 
-    def compute_merkle_root(self):
-        import hashlib
-
-        def hash_pair(a, b):
-            combined = (a + b).encode('utf-8')
-            return hashlib.sha256(combined).hexdigest()
-
-        hashes = list(self.region_hashes.values())
-        if not hashes:
-            return ""
-
-        while len(hashes) > 1:
-            if len(hashes) % 2 == 1:
-                hashes.append(hashes[-1])  # son elemanı çiftlemek
-            hashes = [hash_pair(hashes[i], hashes[i + 1]) for i in range(0, len(hashes), 2)]
-
-        return hashes[0]  # Merkle kökü
 class RegionalBlockchain:
     def __init__(self, region_name: str):
         self.region_name = region_name
-        self.chain = []
-        self.vote_counts = {}
+        self.chain: List[Block] = []
         self.load_chain_from_db()
         if not self.chain:
             self.create_genesis_block()
 
     def create_genesis_block(self):
-        genesis = Block(
-            0, "0", int(time.time()), "Genesis", "Genesis",
-            self.calculate_hash(0, "0", "Genesis", "Genesis")
-        )
+        genesis_hash = self.calculate_hash(0, "0", "Genesis", "Genesis")
+        genesis = Block(0, "0", int(time.time()), "Genesis", "Genesis", genesis_hash)
         self.chain.append(genesis)
         self.save_block_to_db(genesis)
-        self.vote_counts["Genesis"] = 0  # varsayılan
 
     def calculate_hash(self, index, previous_hash, voter_id_hash, candidate):
-        value = f"{index}{previous_hash}{voter_id_hash}{candidate}{self.region_name}"
-        new_hash = hashlib.sha256(value.encode()).hexdigest()
-        return new_hash
+        raw = f"{index}{previous_hash}{voter_id_hash}{candidate}{self.region_name}"
+        return hashlib.sha256(raw.encode()).hexdigest()
 
     def add_vote(self, voter_id: str, candidate: str):
         conn = get_db_connection()
-        cursor = conn.cursor()
+        cur = conn.cursor()
 
-        # 1. Seçmen kontrolü (TC ve bölge eşleşmesi)
-        cursor.execute(
+        # 1️⃣ Seçmen kontrolü (TC ve bölge eşleşmesi)
+        cur.execute(
             "SELECT HasVoted FROM Voters WHERE TC = ? AND Region = ?",
             (voter_id, self.region_name)
         )
-        result = cursor.fetchone()
-
-        if not result:
-            cursor.close()
+        row = cur.fetchone()
+        if not row:
             conn.close()
             raise ValueError("Seçmen bulunamadı veya bölge eşleşmiyor.")
-
-        if result["HasVoted"]:
-            cursor.close()
+        if row["HasVoted"] == 1:
             conn.close()
-            raise ValueError("Bu TC ile zaten oy kullanılmış.")
+            raise ValueError("Bu seçmen zaten oy kullandı.")
 
-        # 2. Blok oluşturma ve zincire ekleme
-        voter_id_hash = hashlib.sha256(voter_id.encode()).hexdigest()
-        index = len(self.chain)
-        previous_hash = self.chain[-1].hash
-        timestamp = int(time.time())
-        hash_value = self.calculate_hash(index, previous_hash, voter_id_hash, candidate)
+        # 2️⃣ Blok oluşturma
+        voter_hash = hashlib.sha256(voter_id.encode()).hexdigest()
+        idx = len(self.chain)
+        prev = self.chain[-1].hash
+        ts = int(time.time())
+        h = self.calculate_hash(idx, prev, voter_hash, candidate)
 
-        block = Block(index, previous_hash, timestamp, voter_id_hash, candidate, hash_value)
+        block = Block(idx, prev, ts, voter_hash, candidate, h)
         self.chain.append(block)
         self.save_block_to_db(block)
 
-        self.vote_counts[candidate] = self.vote_counts.get(candidate, 0) + 1
-
-        # 3. Seçmeni işaretle (HasVoted = 1)
-        cursor.execute(
-            "UPDATE Voters SET HasVoted = 1 WHERE TC = ?",
-            (voter_id,)
+        # 3️⃣ Seçmeni işaretle (HasVoted = 1)
+        cur.execute(
+            "UPDATE Voters SET HasVoted = 1 WHERE TC = ? AND Region = ?",
+            (voter_id, self.region_name)
         )
         conn.commit()
-        cursor.close()
         conn.close()
-
-    def get_results(self):
-        return self.vote_counts
-
-    def get_chain(self):
-        from db.connection import get_db_connection
-
         conn = get_db_connection()
-        cursor = conn.cursor()
+        cur = conn.cursor()
+        cur.execute("""
+                    SELECT Hash
+                    FROM Blocks
+                    WHERE Region = ?
+                    ORDER BY BlockIndex ASC
+                    """, (self.region_name,))
+        hashes = [row["Hash"] for row in cur.fetchall()]
 
-        cursor.execute('''
-            SELECT BlockIndex, PreviousHash, Timestamp, VoterID_Hashed, Hash
+        region_root = calculate_merkle_root(hashes)
+        timestamp = int(time.time())
+
+        # 3) RegionRoots tablosuna upsert (INSERT OR REPLACE)
+        cur.execute("""
+                    INSERT INTO RegionRoots (Region, MerkleRoot, UpdatedAt)
+                    VALUES (?, ?, ?) ON CONFLICT(Region) DO
+                    UPDATE SET
+                        MerkleRoot = excluded.MerkleRoot,
+                        UpdatedAt = excluded.UpdatedAt
+                    """, (self.region_name, region_root, timestamp))
+
+        conn.commit()
+        conn.close()
+    def load_chain_from_db(self):
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT BlockIndex, PreviousHash, Timestamp,
+                   VoterID_Hashed, Candidate, Hash
             FROM Blocks
             WHERE Region = ?
-            ORDER BY BlockIndex ASC
-        ''', (self.region_name,))
-        rows = cursor.fetchall()
+            ORDER BY BlockIndex
+        """, (self.region_name,))
+        rows = cur.fetchall()
+        conn.close()
 
+        self.chain = [
+            Block(r["BlockIndex"], r["PreviousHash"], r["Timestamp"],
+                  r["VoterID_Hashed"], r["Candidate"], r["Hash"])
+            for r in rows
+        ]
+
+    def save_block_to_db(self, block: Block):
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO Blocks
+              (Region, BlockIndex, PreviousHash, Timestamp,
+               VoterID_Hashed, Candidate, Hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            self.region_name,
+            block.index,
+            block.previous_hash,
+            block.timestamp,
+            block.voter_id_hash,
+            block.candidate,
+            block.hash
+        ))
+        conn.commit()
+        conn.close()
+
+    def get_chain(self) -> List[Dict]:
+        # DB’den satır bazlı okur, dict listesi döner
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT BlockIndex, PreviousHash, Timestamp,
+                   VoterID_Hashed, Candidate, Hash
+            FROM Blocks
+            WHERE Region = ?
+            ORDER BY BlockIndex
+        """, (self.region_name,))
+        rows = cur.fetchall()
         conn.close()
 
         return [
             {
-                "index": row["BlockIndex"],
-                "previous_hash": row["PreviousHash"],
-                "timestamp": row["Timestamp"],
-                "voter_id_hash": row["VoterID_Hashed"],
-                "hash": row["Hash"]
+              "index": r["BlockIndex"],
+              "previous_hash": r["PreviousHash"],
+              "timestamp": r["Timestamp"],
+              "voter_id_hash": r["VoterID_Hashed"],
+              "candidate": r["Candidate"],
+              "hash": r["Hash"]
             }
-            for row in rows
+            for r in rows
         ]
-
-    def load_chain_from_db(self):
-        from db.connection import get_db_connection
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        cursor.execute('''
-            SELECT BlockIndex, PreviousHash, Timestamp, VoterID_Hashed, Candidate, Hash
-            FROM Blocks
-            WHERE Region = ?
-            ORDER BY BlockIndex ASC
-        ''', (self.region_name,))
-        rows = cursor.fetchall()
-
-        self.chain = [
-            Block(
-                index=row["BlockIndex"],
-                previous_hash=row["PreviousHash"],
-                timestamp=row["Timestamp"],
-                voter_id_hash=row["VoterID_Hashed"],
-                candidate=row["Candidate"],
-                hash=row["Hash"]
-            )
-            for row in rows
-        ]
-
-        # vote_counts da sıfırlanmasın
-        self.vote_counts = {}
-        for block in self.chain:
-            if block.candidate != "Genesis":
-                self.vote_counts[block.candidate] = self.vote_counts.get(block.candidate, 0) + 1
-
-        conn.close()
-
-    def save_block_to_db(self, block: Block):
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO Blocks (Region, BlockIndex, PreviousHash, Timestamp, VoterID_Hashed, Candidate, Hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (self.region_name, block.index, block.previous_hash, block.timestamp, block.voter_id_hash, block.candidate,
-              block.hash))
-        conn.commit()
-        cursor.close()
-        conn.close()
 
 class MainBlockchain:
     def __init__(self):
-        self.regions = {region: RegionalBlockchain(region) for region in REGIONS}
-        self.create_national_block()
-
-    def create_national_block(self):
-        from db.connection import get_db_connection
-        import hashlib
-
-        region_hashes = {}
-        for region_name, region_chain in self.regions.items():
-            blocks = region_chain.get_chain()
-            if blocks:
-                region_hashes[region_name] = blocks[-1]["hash"]
-
-        def hash_pair(a, b):
-            return hashlib.sha256((a + b).encode()).hexdigest()
-
-        hashes = list(region_hashes.values())
-        if not hashes:
-            return None
-
-        while len(hashes) > 1:
-            if len(hashes) % 2 == 1:
-                hashes.append(hashes[-1])
-            hashes = [hash_pair(hashes[i], hashes[i + 1]) for i in range(0, len(hashes), 2)]
-
-        merkle_root = hashes[0]
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        # Zaten eklenmişse tekrar ekleme
-        cursor.execute("SELECT 1 FROM Blocks WHERE Region = 'Ulusal' AND BlockIndex = 0")
-        if cursor.fetchone():
-            conn.close()
-            return merkle_root
-
-        cursor.execute('''
-            INSERT INTO Blocks (Region, BlockIndex, PreviousHash, Timestamp, VoterID_Hashed, Candidate, Hash)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            "Ulusal",
-            0,
-            "-",
-            int(time.time()),
-            "-",
-            "MerkleRoot",
-            merkle_root
-        ))
-
-        conn.commit()
-        conn.close()
-
-        return merkle_root
+        self.regions = {r: RegionalBlockchain(r) for r in REGIONS}
 
     def vote(self, region: str, voter_id: str, candidate: str):
-        if region not in self.regions:
-            raise ValueError("Geçersiz bölge")
         self.regions[region].add_vote(voter_id, candidate)
 
-    def get_all_results(self):
-        results = {}
-        for region, chain in self.regions.items():
-            results[region] = chain.get_results()
-        return results
+    def get_all_chains(self) -> Dict:
+        return {r: rb.get_chain() for r, rb in self.regions.items()}
 
-    def get_all_chains(self):
-        from db.connection import get_db_connection
+    def get_merkle_structure(self) -> dict:
+        structure = {"root": "Ulusal Seçim Zinciri", "children": [], "merkle_root": ""}
 
-        chains = {}
         conn = get_db_connection()
-        cursor = conn.cursor()
+        cur = conn.cursor()
 
-        for region in self.regions.keys():
-            cursor.execute('''
-                SELECT BlockIndex, PreviousHash, Timestamp, VoterID_Hashed, Candidate, Hash
-                FROM Blocks
-                WHERE Region = ?
-                ORDER BY BlockIndex ASC
-            ''', (region,))
-            rows = cursor.fetchall()
+        # 1) Bölge blokları ve kökleri
+        region_roots = []
+        for region in REGIONS:
+            # A) Bölge zincir bütünlüğünü kontrol et (isteğe bağlı)
+            cur.execute("SELECT BlockIndex, PreviousHash, Timestamp, VoterID_Hashed, Candidate, Hash FROM Blocks WHERE Region = ? ORDER BY BlockIndex", (region,))
+            rows = cur.fetchall()
+            blocks = []
+            for r in rows:
+                blocks.append({
+                    "index": r["BlockIndex"],
+                    "previous_hash": r["PreviousHash"],
+                    "timestamp": r["Timestamp"],
+                    "voter_id_hash": r["VoterID_Hashed"],
+                    "candidate": r["Candidate"],
+                    "hash": r["Hash"],  # lowercase key
+                })
+            ok = validate_chain(blocks, region)
 
-            blocks = [
-                {
-                    "index": row["BlockIndex"],
-                    "previous_hash": row["PreviousHash"],
-                    "timestamp": row["Timestamp"],
-                    "voter_id_hash": row["VoterID_Hashed"],
-                    "candidate": row["Candidate"],
-                    "hash": row["Hash"]
-                }
-                for row in rows
-            ]
+            # B) Bölge Merkle root’unu RegionRoots’tan al
+            cur.execute("SELECT MerkleRoot, UpdatedAt FROM RegionRoots WHERE Region = ?", (region,))
+            root_row = cur.fetchone()
+            region_root = root_row["MerkleRoot"] if root_row else ""
 
-            chains[region] = blocks
+            entry = {
+                "region": region,
+                "status": "OK" if ok else "BROKEN",
+                "blocks": blocks,
+                "merkle_root": region_root,
+                "updated_at": root_row["UpdatedAt"] if root_row else None
+            }
+            structure["children"].append(entry)
+            if ok and region_root:
+                region_roots.append(region_root)
+
+        # 2) Ulusal Merkle root — bölge köklerini kullan
+        structure["merkle_root"] = calculate_merkle_root(region_roots)
 
         conn.close()
-        return chains
-
-    def get_merkle_structure(self):
-        from db.connection import get_db_connection
-        import hashlib
-
-        structure = {
-            "root": "Ulusal Seçim Zinciri",
-            "children": [],
-            "merkle_root": ""
-        }
-
-        region_hashes = {}
-        conn = get_db_connection()
-        cursor = conn.cursor()
-
-        for region_name in self.regions.keys():
-            cursor.execute('''
-                SELECT BlockIndex, PreviousHash, Timestamp, VoterID_Hashed, Candidate, Hash
-                FROM Blocks
-                WHERE Region = ?
-                ORDER BY BlockIndex ASC
-            ''', (region_name,))
-            rows = cursor.fetchall()
-
-            blocks = [
-                {
-                    "index": row["BlockIndex"],
-                    "previous_hash": row["PreviousHash"],
-                    "timestamp": row["Timestamp"],
-                    "voter_id_hash": row["VoterID_Hashed"],
-                    "candidate": row["Candidate"],
-                    "hash": row["Hash"]
-                }
-                for row in rows
-            ]
-
-            if blocks:
-                region_hashes[region_name] = blocks[-1]["hash"]
-
-            structure["children"].append({
-                "region": region_name,
-                "blocks": blocks
-            })
-
-        conn.close()
-
-        def compute_merkle_root(hashes):
-            if not hashes:
-                return ""
-
-            def hash_pair(a, b):
-                return hashlib.sha256((a + b).encode('utf-8')).hexdigest()
-
-            while len(hashes) > 1:
-                if len(hashes) % 2 == 1:
-                    hashes.append(hashes[-1])
-                hashes = [hash_pair(hashes[i], hashes[i + 1]) for i in range(0, len(hashes), 2)]
-            return hashes[0]
-
-        structure["merkle_root"] = compute_merkle_root(list(region_hashes.values()))
         return structure
-
-    def get_national_block(self):
-        region_hashes = {}
-
-        for region, chain in self.regions.items():
-            region_chain = chain.get_chain()
-            if region_chain:
-                last_block_hash = region_chain[-1]["hash"]
-                region_hashes[region] = last_block_hash
-
-        return NationalBlock(region_hashes)
-
-
