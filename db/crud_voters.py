@@ -75,3 +75,48 @@ def get_voter(tc: str, region: str):
     voter = cursor.fetchone()
     conn.close()
     return voter  # pyodbc Row objesi döner
+
+def get_admin(username: str):
+    """Admin kullanıcısını veritabanından çeker"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # Admin tablosunu kontrol et, yoksa oluştur
+    try:
+        cur.execute("SELECT * FROM Admins LIMIT 1")
+    except Exception:
+        cur.execute("""
+            CREATE TABLE Admins (
+                Username TEXT PRIMARY KEY,
+                Password TEXT NOT NULL
+            )
+        """)
+        # Varsayılan admin kullanıcısı oluştur
+        from auth.jwt_handler import hash_password
+        default_admin_pw = hash_password("admin123")
+        cur.execute("""
+            INSERT INTO Admins (Username, Password)
+            VALUES (?, ?)
+        """, ("admin", default_admin_pw))
+        conn.commit()
+    
+    cur.execute("SELECT * FROM Admins WHERE Username = ?", (username,))
+    admin = cur.fetchone()
+    conn.close()
+    
+    return admin
+
+def create_admin(username: str, hashed_password: str):
+    """Yeni admin kullanıcısı oluşturur"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    cur.execute("""
+        INSERT INTO Admins (Username, Password)
+        VALUES (?, ?)
+    """, (username, hashed_password))
+    
+    conn.commit()
+    conn.close()
+    
+    return True

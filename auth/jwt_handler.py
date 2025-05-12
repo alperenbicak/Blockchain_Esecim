@@ -34,12 +34,50 @@ def get_current_voter(token: str = Depends(oauth2_scheme)):
         detail="Geçersiz kimlik bilgisi",
         headers={"WWW-Authenticate": "Bearer"},
     )
+    
+    # Token blacklist kontrolü
+    if is_token_blacklisted(token):
+        raise credentials_exception
+        
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        tc = payload.get("sub")
-        region = payload.get("region")
-        if tc is None or region is None:
+        sub = payload.get("sub")
+        role = payload.get("role", "voter")
+        
+        if sub is None:
             raise credentials_exception
-        return {"tc": tc, "region": region}
+            
+        if role == "voter":
+            tc = sub
+            region = payload.get("region")
+            if region is None:
+                raise credentials_exception
+            return {"tc": tc, "region": region, "role": role}
+        elif role == "admin":
+            username = sub
+            return {"username": username, "role": role}
+        else:
+            raise credentials_exception
     except JWTError:
         raise credentials_exception
+
+# Admin rolünü kontrol et
+def admin_required(current_user: dict = Depends(get_current_voter)):
+    if current_user.get("role") != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Bu işlem için admin yetkisi gerekiyor"
+        )
+    return current_user
+
+# Token blacklist için basit bir in-memory çözüm
+# Gerçek uygulamada Redis veya veritabanı kullanılabilir
+BLACKLISTED_TOKENS = set()
+
+def blacklist_token(token: str):
+    """Token'ı blacklist'e ekler"""
+    BLACKLISTED_TOKENS.add(token)
+
+def is_token_blacklisted(token: str) -> bool:
+    """Token'ın blacklist'te olup olmadığını kontrol eder"""
+    return token in BLACKLISTED_TOKENS

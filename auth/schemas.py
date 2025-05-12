@@ -10,3 +10,7 @@ class LoginRequest(BaseModel):
     tc: str
     region: str
     password: str
+
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
