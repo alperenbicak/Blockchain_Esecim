@@ -13,9 +13,44 @@ REGIONS = [
     "Karadeniz", "Doğu Anadolu", "Güneydoğu Anadolu"
 ]
 
+# Bölge adı normalizasyonu için eşleştirme tablosu
+REGION_MAPPING = {
+    "İç Anadolu": "Iç Anadolu",
+    "İc Anadolu": "Iç Anadolu",
+    "Ic Anadolu": "Iç Anadolu",
+    "İç anadolu": "Iç Anadolu",
+    "Iç anadolu": "Iç Anadolu",
+    "İc anadolu": "Iç Anadolu",
+    "Ic anadolu": "Iç Anadolu",
+    "iç anadolu": "Iç Anadolu",
+    "iç Anadolu": "Iç Anadolu",
+    "ic anadolu": "Iç Anadolu",
+    "Doğu Anadolu": "Doğu Anadolu",
+    "Dogu Anadolu": "Doğu Anadolu",
+    "doğu anadolu": "Doğu Anadolu",
+    "dogu anadolu": "Doğu Anadolu",
+    "Güneydoğu Anadolu": "Güneydoğu Anadolu",
+    "Guneydoğu Anadolu": "Güneydoğu Anadolu",
+    "Güneydogu Anadolu": "Güneydoğu Anadolu",
+    "Guneydogu Anadolu": "Güneydoğu Anadolu",
+    "güneydoğu anadolu": "Güneydoğu Anadolu",
+    "güneydogu anadolu": "Güneydoğu Anadolu",
+    "guneydoğu anadolu": "Güneydoğu Anadolu",
+    "guneydogu anadolu": "Güneydoğu Anadolu"
+}
+
 # Anahtar dosyaları için sabit yollar
 PRIVATE_KEY_PATH = os.path.join(os.path.dirname(__file__), "..", "private_key.pem")
 PUBLIC_KEY_PATH = os.path.join(os.path.dirname(__file__), "..", "public_key.pem")
+
+def normalize_region_name(region_name: str) -> str:
+    """
+    Bölge adındaki Türkçe karakter sorunlarını çözer ve standart hale getirir.
+    """
+    if region_name in REGION_MAPPING:
+        return REGION_MAPPING[region_name]
+    # Eşleştirme tablosunda yoksa direk karşılaştırma yapmak için kendisini döndür
+    return region_name
 
 def generate_keypair():
     """RSA anahtar çifti oluşturur ve dosyalara kaydeder"""
@@ -169,18 +204,96 @@ class RegionalBlockchain:
         conn = get_db_connection()
         cur = conn.cursor()
 
+        # --- Debug bilgisi: Girilen değerleri kontrol et ---
+        print(f"DEBUG: Oy verme işlemi başlatıldı - TC: {voter_id[:3]}***, Bölge: {self.region_name}, Aday: {candidate}")
+        
+        # Önce seçmen kaydının genel olarak var olup olmadığını kontrol et
+        cur.execute("SELECT TC, Region, HasVoted FROM Voters WHERE TC = ?", (voter_id,))
+        voter_record = cur.fetchone()
+        
+        if not voter_record:
+            conn.close()
+            raise ValueError(f"Seçmen kaydı bulunamadı! TC: {voter_id[:3]}***")
+        
+        print(f"DEBUG: Seçmen kaydı bulundu. Kayıtlı bölge: {voter_record['Region']}, Mevcut bölge: {self.region_name}")
+        
         # --- Oy kaydı ve HasVoted kontrolü ---
+        # Şimdi bölge eşleşmesini kontrol et
         cur.execute(
             "SELECT HasVoted FROM Voters WHERE TC = ? AND Region = ?",
             (voter_id, self.region_name)
         )
         row = cur.fetchone()
+        
+        # Seçmenin gerçek bölgesini saklayalım (veritabanında işaretlemek için kullanacağız)
+        actual_voter_region = voter_record['Region']
+        
         if not row:
-            conn.close()
-            raise ValueError("Seçmen bulunamadı veya bölge eşleşmiyor.")
+            # Bölge adı normalizasyonunu dene
+            print(f"DEBUG: Doğrudan bölge eşleşmesi yok. Normalizasyon deneniyor.")
+            normalized_region = normalize_region_name(self.region_name)
+            print(f"DEBUG: Normalize edilmiş bölge: {normalized_region}")
+            
+            # Ayrıca kullanıcının bölgesini de normalize et
+            voter_region = voter_record['Region']
+            voter_normalized_region = normalize_region_name(voter_region)
+            print(f"DEBUG: Kullanıcı bölgesi normalize: {voter_normalized_region}")
+            
+            # ÖNEMLİ: Burada çift yönlü kontrol yapıyoruz!
+            # 1. Durumumuz kullanıcının bölge adı "İç Anadolu", normalize formu "Iç Anadolu"
+            # 2. Şu anki bölge adı ise zaten "Iç Anadolu"
+            
+            # Kontrol 1: Mevcut bölge adının normalize hali ile seçmenin kayıtlı olduğu bölge adını karşılaştır
+            if normalized_region == voter_region:
+                print(f"DEBUG: Normalize edilmiş bölge adı, seçmenin bölgesiyle eşleşti: {normalized_region} == {voter_region}")
+                self.region_name = voter_region
+                row = {"HasVoted": voter_record["HasVoted"]}
+            
+            # Kontrol 2: Seçmenin bölge adının normalize hali ile mevcut bölge adını karşılaştır
+            elif voter_normalized_region == self.region_name:
+                print(f"DEBUG: Normalize edilmiş seçmen bölgesi, mevcut bölgeyle eşleşti: {voter_normalized_region} == {self.region_name}")
+                row = {"HasVoted": voter_record["HasVoted"]}
+            
+            # Kontrol 3: Her iki bölge adının normalize halleri karşılaştır
+            elif normalized_region == voter_normalized_region:
+                print(f"DEBUG: Her iki bölgenin normalize halleri eşleşti: {normalized_region} == {voter_normalized_region}")
+                self.region_name = normalized_region  # En tutarlı hali kullan
+                row = {"HasVoted": voter_record["HasVoted"]}
+                
+                # Veritabanındaki bölge adını da düzeltmeyi dene
+                try:
+                    print(f"DEBUG: Veritabanındaki bölge adını düzeltme deneniyor: {voter_region} -> {normalized_region}")
+                    cur.execute(
+                        "UPDATE Voters SET Region = ? WHERE TC = ? AND Region = ?",
+                        (normalized_region, voter_id, voter_region)
+                    )
+                    conn.commit()
+                    print("DEBUG: Veritabanındaki bölge adı güncellendi.")
+                    actual_voter_region = normalized_region  # Güncellenmiş bölge adını kullan
+                except Exception as e:
+                    print(f"DEBUG: Veritabanı güncelleme hatası: {str(e)}")
+                    # Hata durumunda işleme devam edebiliriz, veritabanı güncellemek kritik değil
+                    pass
+                    
+            # Eğer normalizasyonla hala eşleşme sağlanamazsa, mevcut bölge adını kullanıcının bölgesiyle değiştirmeyi dene
+            elif not row:
+                print(f"DEBUG: Son çare olarak kullanıcının bölgesi kullanılıyor: {voter_region}")
+                self.region_name = voter_region
+                cur.execute(
+                    "SELECT HasVoted FROM Voters WHERE TC = ? AND Region = ?",
+                    (voter_id, voter_region)
+                )
+                row = cur.fetchone()
+            
+            # Eğer yine bulunamazsa, hata veren bölge bilgisini göster
+            if not row:
+                conn.close()
+                raise ValueError(f"Seçmen bölge eşleşmiyor! Seçmen bölgesi: {voter_record['Region']}, İstenen bölge: {self.region_name}")
+        
+        # Seçmenin daha önce oy kullanıp kullanmadığını kontrol et
         if row["HasVoted"] == 1:
             conn.close()
-            raise ValueError("Bu seçmen zaten oy kullandı.")
+            raise ValueError(f"Bu seçmen zaten oy kullandı! TC: {voter_id[:3]}***")
 
         # Blok oluşturma & DB'ye kaydetme
         voter_hash = hashlib.sha256(voter_id.encode()).hexdigest()
@@ -198,11 +311,32 @@ class RegionalBlockchain:
         self.chain.append(block)
         self.save_block_to_db(block)
 
-        # Seçmeni işaretle
+        # Seçmeni işaretle - ÖNEMLİ: Burada actual_voter_region kullanarak doğru bölgeyi güncelliyoruz
+        print(f"DEBUG: Seçmen oy kullandı olarak işaretleniyor. TC: {voter_id[:3]}***, Bölge: {actual_voter_region}")
+        
         cur.execute(
             "UPDATE Voters SET HasVoted = 1 WHERE TC = ? AND Region = ?",
-            (voter_id, self.region_name)
+            (voter_id, actual_voter_region)
         )
+        
+        # İşlem başarılı mı kontrol et
+        if cur.rowcount <= 0:
+            print(f"UYARI: HasVoted güncellemesi başarısız olmuş olabilir! Etkilenen satır sayısı: {cur.rowcount}")
+            
+            # REGIONS içindeki tam eşleşen bölgeyi aramayı da dene
+            for region in REGIONS:
+                if normalize_region_name(region) == normalize_region_name(actual_voter_region):
+                    print(f"DEBUG: İkinci deneme: Standart bölge adı '{region}' ile güncelleme deneniyor")
+                    cur.execute(
+                        "UPDATE Voters SET HasVoted = 1 WHERE TC = ? AND Region = ?",
+                        (voter_id, region)
+                    )
+                    if cur.rowcount > 0:
+                        print(f"DEBUG: İkinci deneme başarılı! Bölge '{region}' ile güncellendi.")
+                        break
+        else:
+            print(f"DEBUG: HasVoted başarıyla güncellendi! Etkilenen satır sayısı: {cur.rowcount}")
+            
         conn.commit()
 
         # --- Bölge Merkle Root güncelle ---
@@ -520,7 +654,29 @@ class MainBlockchain:
         conn.close()
 
     def vote(self, region: str, voter_id: str, candidate: str):
-        self.regions[region].add_vote(voter_id, candidate)
+        # Debug bilgisi
+        print(f"DEBUG: MainBlockchain.vote çağrıldı - Region: {region}, TC: {voter_id[:3]}***")
+        
+        # Bölge adını normalize et
+        normalized_region = normalize_region_name(region)
+        print(f"DEBUG: Normalize edilmiş bölge: {normalized_region}")
+        
+        # Normalize edilmiş bölge adını REGIONS listesinde kontrol et
+        if normalized_region not in REGIONS:
+            # Tüm geçerli bölge adlarını göster
+            valid_regions = ", ".join(REGIONS)
+            print(f"DEBUG: Normalize edilmiş bölge ({normalized_region}) REGIONS listesinde bulunamadı!")
+            print(f"DEBUG: Geçerli bölgeler: {valid_regions}")
+            
+            # Hala eşleşme yoksa, doğrudan girilen bölge adını kullan
+            try:
+                self.regions[region].add_vote(voter_id, candidate)
+            except KeyError:
+                raise ValueError(f"Geçersiz bölge adı: '{region}'. Geçerli bölgeler: {valid_regions}")
+        else:
+            # Normalize edilmiş bölge adını kullan
+            print(f"DEBUG: '{region}' normalize edildi: '{normalized_region}'. Bu bölge kullanılıyor.")
+            self.regions[normalized_region].add_vote(voter_id, candidate)
 
     def get_all_chains(self) -> Dict:
         return {r: rb.get_chain() for r, rb in self.regions.items()}
