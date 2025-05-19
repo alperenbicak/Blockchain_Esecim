@@ -5,8 +5,10 @@ import base64
 from typing import List, Dict, Optional
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import hashes, serialization
-from db.connection import get_db_connection
+from db.connection import get_db_connection, get_db_session
+from db.models import Block as BlockModel, Voter, RegionRoot, NationalRoot
 from blockchain.utils import validate_chain, calculate_merkle_root
+from sqlalchemy import select, update
 
 REGIONS = [
     "Marmara", "Ege", "Akdeniz", "Iç Anadolu",
@@ -201,339 +203,284 @@ class RegionalBlockchain:
         return hashlib.sha256(raw.encode()).hexdigest()
 
     def add_vote(self, voter_id: str, candidate: str):
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        # --- Debug bilgisi: Girilen değerleri kontrol et ---
-        print(f"DEBUG: Oy verme işlemi başlatıldı - TC: {voter_id[:3]}***, Bölge: {self.region_name}, Aday: {candidate}")
-        
-        # Önce seçmen kaydının genel olarak var olup olmadığını kontrol et
-        cur.execute("SELECT TC, Region, HasVoted FROM Voters WHERE TC = ?", (voter_id,))
-        voter_record = cur.fetchone()
-        
-        if not voter_record:
-            conn.close()
-            raise ValueError(f"Seçmen kaydı bulunamadı! TC: {voter_id[:3]}***")
-        
-        print(f"DEBUG: Seçmen kaydı bulundu. Kayıtlı bölge: {voter_record['Region']}, Mevcut bölge: {self.region_name}")
-        
-        # --- Oy kaydı ve HasVoted kontrolü ---
-        # Şimdi bölge eşleşmesini kontrol et
-        cur.execute(
-            "SELECT HasVoted FROM Voters WHERE TC = ? AND Region = ?",
-            (voter_id, self.region_name)
-        )
-        row = cur.fetchone()
-        
-        # Seçmenin gerçek bölgesini saklayalım (veritabanında işaretlemek için kullanacağız)
-        actual_voter_region = voter_record['Region']
-        
-        if not row:
-            # Bölge adı normalizasyonunu dene
-            print(f"DEBUG: Doğrudan bölge eşleşmesi yok. Normalizasyon deneniyor.")
-            normalized_region = normalize_region_name(self.region_name)
-            print(f"DEBUG: Normalize edilmiş bölge: {normalized_region}")
+        # SQLAlchemy ile sorguları dönüştürüyoruz
+        with get_db_session() as session:
+            # Debug bilgisi: Girilen değerleri kontrol et
+            print(f"DEBUG: Oy verme işlemi başlatıldı - TC: {voter_id[:3]}***, Bölge: {self.region_name}, Aday: {candidate}")
             
-            # Ayrıca kullanıcının bölgesini de normalize et
-            voter_region = voter_record['Region']
-            voter_normalized_region = normalize_region_name(voter_region)
-            print(f"DEBUG: Kullanıcı bölgesi normalize: {voter_normalized_region}")
+            # Önce seçmen kaydının genel olarak var olup olmadığını kontrol et
+            voter_query = select(Voter).where(Voter.TC == voter_id)
+            voter_record = session.execute(voter_query).scalar_one_or_none()
             
-            # ÖNEMLİ: Burada çift yönlü kontrol yapıyoruz!
-            # 1. Durumumuz kullanıcının bölge adı "İç Anadolu", normalize formu "Iç Anadolu"
-            # 2. Şu anki bölge adı ise zaten "Iç Anadolu"
+            if not voter_record:
+                raise ValueError(f"Seçmen kaydı bulunamadı! TC: {voter_id[:3]}***")
             
-            # Kontrol 1: Mevcut bölge adının normalize hali ile seçmenin kayıtlı olduğu bölge adını karşılaştır
-            if normalized_region == voter_region:
-                print(f"DEBUG: Normalize edilmiş bölge adı, seçmenin bölgesiyle eşleşti: {normalized_region} == {voter_region}")
-                self.region_name = voter_region
-                row = {"HasVoted": voter_record["HasVoted"]}
+            print(f"DEBUG: Seçmen kaydı bulundu. Kayıtlı bölge: {voter_record.Region}, Mevcut bölge: {self.region_name}")
             
-            # Kontrol 2: Seçmenin bölge adının normalize hali ile mevcut bölge adını karşılaştır
-            elif voter_normalized_region == self.region_name:
-                print(f"DEBUG: Normalize edilmiş seçmen bölgesi, mevcut bölgeyle eşleşti: {voter_normalized_region} == {self.region_name}")
-                row = {"HasVoted": voter_record["HasVoted"]}
+            # Şimdi bölge eşleşmesini kontrol et
+            region_match_query = select(Voter).where(
+                (Voter.TC == voter_id) & (Voter.Region == self.region_name)
+            )
+            row = session.execute(region_match_query).scalar_one_or_none()
             
-            # Kontrol 3: Her iki bölge adının normalize halleri karşılaştır
-            elif normalized_region == voter_normalized_region:
-                print(f"DEBUG: Her iki bölgenin normalize halleri eşleşti: {normalized_region} == {voter_normalized_region}")
-                self.region_name = normalized_region  # En tutarlı hali kullan
-                row = {"HasVoted": voter_record["HasVoted"]}
-                
-                # Veritabanındaki bölge adını da düzeltmeyi dene
-                try:
-                    print(f"DEBUG: Veritabanındaki bölge adını düzeltme deneniyor: {voter_region} -> {normalized_region}")
-                    cur.execute(
-                        "UPDATE Voters SET Region = ? WHERE TC = ? AND Region = ?",
-                        (normalized_region, voter_id, voter_region)
-                    )
-                    conn.commit()
-                    print("DEBUG: Veritabanındaki bölge adı güncellendi.")
-                    actual_voter_region = normalized_region  # Güncellenmiş bölge adını kullan
-                except Exception as e:
-                    print(f"DEBUG: Veritabanı güncelleme hatası: {str(e)}")
-                    # Hata durumunda işleme devam edebiliriz, veritabanı güncellemek kritik değil
-                    pass
-                    
-            # Eğer normalizasyonla hala eşleşme sağlanamazsa, mevcut bölge adını kullanıcının bölgesiyle değiştirmeyi dene
-            elif not row:
-                print(f"DEBUG: Son çare olarak kullanıcının bölgesi kullanılıyor: {voter_region}")
-                self.region_name = voter_region
-                cur.execute(
-                    "SELECT HasVoted FROM Voters WHERE TC = ? AND Region = ?",
-                    (voter_id, voter_region)
-                )
-                row = cur.fetchone()
+            # Seçmenin gerçek bölgesini saklayalım
+            actual_voter_region = voter_record.Region
             
-            # Eğer yine bulunamazsa, hata veren bölge bilgisini göster
             if not row:
-                conn.close()
-                raise ValueError(f"Seçmen bölge eşleşmiyor! Seçmen bölgesi: {voter_record['Region']}, İstenen bölge: {self.region_name}")
-        
-        # Seçmenin daha önce oy kullanıp kullanmadığını kontrol et
-        if row["HasVoted"] == 1:
-            conn.close()
-            raise ValueError(f"Bu seçmen zaten oy kullandı! TC: {voter_id[:3]}***")
-
-        # Blok oluşturma & DB'ye kaydetme
-        voter_hash = hashlib.sha256(voter_id.encode()).hexdigest()
-        idx = len(self.chain)
-        prev = self.chain[-1].hash
-        ts = int(time.time())
-        h = self.calculate_hash(idx, prev, voter_hash, candidate)
-        block = Block(idx, prev, ts, voter_hash, candidate, h)
-        
-        # Blok imzasını doğrula
-        if not block.verify():
-            conn.close()
-            raise ValueError("Blok imzası doğrulanamadı! Güvenlik ihlali olabilir.")
-            
-        self.chain.append(block)
-        self.save_block_to_db(block)
-
-        # Seçmeni işaretle - ÖNEMLİ: Burada actual_voter_region kullanarak doğru bölgeyi güncelliyoruz
-        print(f"DEBUG: Seçmen oy kullandı olarak işaretleniyor. TC: {voter_id[:3]}***, Bölge: {actual_voter_region}")
-        
-        cur.execute(
-            "UPDATE Voters SET HasVoted = 1 WHERE TC = ? AND Region = ?",
-            (voter_id, actual_voter_region)
-        )
-        
-        # İşlem başarılı mı kontrol et
-        if cur.rowcount <= 0:
-            print(f"UYARI: HasVoted güncellemesi başarısız olmuş olabilir! Etkilenen satır sayısı: {cur.rowcount}")
-            
-            # REGIONS içindeki tam eşleşen bölgeyi aramayı da dene
-            for region in REGIONS:
-                if normalize_region_name(region) == normalize_region_name(actual_voter_region):
-                    print(f"DEBUG: İkinci deneme: Standart bölge adı '{region}' ile güncelleme deneniyor")
-                    cur.execute(
-                        "UPDATE Voters SET HasVoted = 1 WHERE TC = ? AND Region = ?",
-                        (voter_id, region)
-                    )
-                    if cur.rowcount > 0:
-                        print(f"DEBUG: İkinci deneme başarılı! Bölge '{region}' ile güncellendi.")
-                        break
-        else:
-            print(f"DEBUG: HasVoted başarıyla güncellendi! Etkilenen satır sayısı: {cur.rowcount}")
-            
-        conn.commit()
-
-        # --- Bölge Merkle Root güncelle ---
-        cur.execute(
-            "SELECT Hash FROM Blocks WHERE Region = ? ORDER BY BlockIndex ASC",
-            (self.region_name,)
-        )
-        hashes = [r["Hash"] for r in cur.fetchall()]
-        region_root = calculate_merkle_root(hashes)
-        now = int(time.time())
-        
-        # Bölge kökünü imzala
-        region_signature = sign_data(region_root)
-        
-        # Signature sütununu kontrol et ve gerekirse ekle
-        try:
-            cur.execute("SELECT Signature FROM RegionRoots LIMIT 1")
-        except Exception:
-            # Sütun yoksa ekle
-            cur.execute("ALTER TABLE RegionRoots ADD COLUMN Signature TEXT")
-        
-        cur.execute("""
-                    INSERT INTO RegionRoots (Region, MerkleRoot, UpdatedAt, Signature)
-                    VALUES (?, ?, ?, ?) ON CONFLICT(Region) DO
-                    UPDATE SET
-                        MerkleRoot = excluded.MerkleRoot,
-                        UpdatedAt = excluded.UpdatedAt,
-                        Signature = excluded.Signature
-                    """, (self.region_name, region_root, now, region_signature))
-        conn.commit()
-
-        # --- Ulusal Merkle Root güncelle ---
-        # Burada tüm bölge köklerini tekrar çekip ulusal kökü hesaplıyoruz
-        # Alfabetik değil, REGIONS sırasına göre alıyoruz
-        region_roots = []
-        for region in REGIONS:
-            cur.execute("SELECT MerkleRoot FROM RegionRoots WHERE Region = ?", (region,))
-            result = cur.fetchone()
-            if result:
-                region_roots.append(result["MerkleRoot"])
+                # Bölge adı normalizasyonunu dene
+                print(f"DEBUG: Doğrudan bölge eşleşmesi yok. Normalizasyon deneniyor.")
+                normalized_region = normalize_region_name(self.region_name)
+                print(f"DEBUG: Normalize edilmiş bölge: {normalized_region}")
                 
-        national_root = calculate_merkle_root(region_roots)
-        national_signature = sign_data(national_root)
-        
-        # Signature sütununu kontrol et ve gerekirse ekle
-        try:
-            cur.execute("SELECT Signature FROM NationalRoots LIMIT 1")
-        except Exception:
-            # Sütun yoksa ekle
-            cur.execute("ALTER TABLE NationalRoots ADD COLUMN Signature TEXT")
+                # Ayrıca kullanıcının bölgesini de normalize et
+                voter_region = voter_record.Region
+                voter_normalized_region = normalize_region_name(voter_region)
+                print(f"DEBUG: Kullanıcı bölgesi normalize: {voter_normalized_region}")
+                
+                # Kontrol 1: Mevcut bölge adının normalize hali ile seçmenin kayıtlı olduğu bölge adını karşılaştır
+                if normalized_region == voter_region:
+                    print(f"DEBUG: Normalize edilmiş bölge adı, seçmenin bölgesiyle eşleşti: {normalized_region} == {voter_region}")
+                    self.region_name = voter_region
+                    row = voter_record
+                
+                # Kontrol 2: Seçmenin bölge adının normalize hali ile mevcut bölge adını karşılaştır
+                elif voter_normalized_region == self.region_name:
+                    print(f"DEBUG: Normalize edilmiş seçmen bölgesi, mevcut bölgeyle eşleşti: {voter_normalized_region} == {self.region_name}")
+                    row = voter_record
+                
+                # Kontrol 3: Her iki bölge adının normalize halleri karşılaştır
+                elif normalized_region == voter_normalized_region:
+                    print(f"DEBUG: Her iki bölgenin normalize halleri eşleşti: {normalized_region} == {voter_normalized_region}")
+                    self.region_name = normalized_region  # En tutarlı hali kullan
+                    row = voter_record
+                    
+                    # Veritabanındaki bölge adını da düzeltmeyi dene
+                    try:
+                        print(f"DEBUG: Veritabanındaki bölge adını düzeltme deneniyor: {voter_region} -> {normalized_region}")
+                        update_stmt = update(Voter).where(
+                            (Voter.TC == voter_id) & (Voter.Region == voter_region)
+                        ).values(Region=normalized_region)
+                        
+                        session.execute(update_stmt)
+                        session.commit()
+                        print("DEBUG: Veritabanındaki bölge adı güncellendi.")
+                        actual_voter_region = normalized_region  # Güncellenmiş bölge adını kullan
+                    except Exception as e:
+                        print(f"DEBUG: Veritabanı güncelleme hatası: {str(e)}")
+                        # Hata durumunda işleme devam edebiliriz, veritabanı güncellemek kritik değil
+                        pass
+                        
+                # Eğer normalizasyonla hala eşleşme sağlanamazsa, mevcut bölge adını kullanıcının bölgesiyle değiştirmeyi dene
+                elif not row:
+                    print(f"DEBUG: Son çare olarak kullanıcının bölgesi kullanılıyor: {voter_region}")
+                    self.region_name = voter_region
+                    voter_in_region_query = select(Voter).where(
+                        (Voter.TC == voter_id) & (Voter.Region == voter_region)
+                    )
+                    row = session.execute(voter_in_region_query).scalar_one_or_none()
+                
+                # Eğer yine bulunamazsa, hata veren bölge bilgisini göster
+                if not row:
+                    raise ValueError(f"Seçmen bölge eşleşmiyor! Seçmen bölgesi: {voter_record.Region}, İstenen bölge: {self.region_name}")
             
-        cur.execute("""
-                    UPDATE NationalRoots
-                    SET MerkleRoot = ?,
-                        UpdatedAt  = ?,
-                        Signature  = ?
-                    WHERE Id = 0
-                    """, (national_root, now, national_signature))
-        conn.commit()
+            # Seçmenin daha önce oy kullanıp kullanmadığını kontrol et
+            if row.HasVoted:
+                raise ValueError(f"Bu seçmen zaten oy kullandı! TC: {voter_id[:3]}***")
 
-        conn.close()
+            # Blok oluşturma & DB'ye kaydetme
+            voter_hash = hashlib.sha256(voter_id.encode()).hexdigest()
+            idx = len(self.chain)
+            prev = self.chain[-1].hash
+            ts = int(time.time())
+            h = self.calculate_hash(idx, prev, voter_hash, candidate)
+            block = Block(idx, prev, ts, voter_hash, candidate, h)
+            
+            # Blok imzasını doğrula
+            if not block.verify():
+                raise ValueError("Blok imzası doğrulanamadı! Güvenlik ihlali olabilir.")
+                
+            self.chain.append(block)
+            self.save_block_to_db(block)
+
+            # Seçmeni işaretle - ÖNEMLİ: Burada actual_voter_region kullanarak doğru bölgeyi güncelliyoruz
+            print(f"DEBUG: Seçmen oy kullandı olarak işaretleniyor. TC: {voter_id[:3]}***, Bölge: {actual_voter_region}")
+            
+            update_stmt = update(Voter).where(
+                (Voter.TC == voter_id) & (Voter.Region == actual_voter_region)
+            ).values(HasVoted=True)
+            
+            result = session.execute(update_stmt)
+            session.commit()
+            
+            # İşlem başarılı mı kontrol et
+            if result.rowcount <= 0:
+                print(f"UYARI: HasVoted güncellemesi başarısız olmuş olabilir! Etkilenen satır sayısı: {result.rowcount}")
+                
+                # REGIONS içindeki tam eşleşen bölgeyi aramayı da dene
+                for region in REGIONS:
+                    if normalize_region_name(region) == normalize_region_name(actual_voter_region):
+                        print(f"DEBUG: İkinci deneme: Standart bölge adı '{region}' ile güncelleme deneniyor")
+                        update_stmt = update(Voter).where(
+                            (Voter.TC == voter_id) & (Voter.Region == region)
+                        ).values(HasVoted=True)
+                        
+                        result = session.execute(update_stmt)
+                        session.commit()
+                        
+                        if result.rowcount > 0:
+                            print(f"DEBUG: İkinci deneme başarılı! Bölge '{region}' ile güncellendi.")
+                            break
+            else:
+                print(f"DEBUG: HasVoted başarıyla güncellendi! Etkilenen satır sayısı: {result.rowcount}")
+
+            # --- Bölge Merkle Root güncelle ---
+            blocks_query = select(BlockModel.Hash).where(
+                BlockModel.Region == self.region_name
+            ).order_by(BlockModel.BlockIndex.asc())
+            
+            hashes = [row[0] for row in session.execute(blocks_query).fetchall()]
+            region_root = calculate_merkle_root(hashes)
+            now = int(time.time())
+            
+            # Bölge kökünü imzala
+            region_signature = sign_data(region_root)
+
+            # RegionRoot tablosuna ekle veya güncelle
+            region_root_obj = session.execute(
+                select(RegionRoot).where(RegionRoot.Region == self.region_name)
+            ).scalar_one_or_none()
+            
+            if region_root_obj:
+                # Mevcut kaydı güncelle
+                region_root_obj.MerkleRoot = region_root
+                region_root_obj.UpdatedAt = now
+                region_root_obj.Signature = region_signature
+            else:
+                # Yeni kayıt ekle
+                new_region_root = RegionRoot(
+                    Region=self.region_name,
+                    MerkleRoot=region_root,
+                    UpdatedAt=now,
+                    Signature=region_signature
+                )
+                session.add(new_region_root)
+                
+            session.commit()
+
+            # --- Ulusal Merkle Root güncelle ---
+            # Burada tüm bölge köklerini tekrar çekip ulusal kökü hesaplıyoruz
+            # Alfabetik değil, REGIONS sırasına göre alıyoruz
+            region_roots = []
+            for region in REGIONS:
+                region_root_query = select(RegionRoot.MerkleRoot).where(RegionRoot.Region == region)
+                result = session.execute(region_root_query).scalar_one_or_none()
+                if result:
+                    region_roots.append(result)
+                    
+            national_root = calculate_merkle_root(region_roots)
+            national_signature = sign_data(national_root)
+
+            # NationalRoot tablosunu güncelle (tek bir kayıt var, Id=0)
+            national_root_obj = session.execute(
+                select(NationalRoot).where(NationalRoot.Id == 0)
+            ).scalar_one_or_none()
+            
+            if national_root_obj:
+                # Mevcut kaydı güncelle
+                national_root_obj.MerkleRoot = national_root
+                national_root_obj.UpdatedAt = now
+                national_root_obj.Signature = national_signature
+            else:
+                # Yeni kayıt ekle
+                new_national_root = NationalRoot(
+                    Id=0,
+                    MerkleRoot=national_root,
+                    UpdatedAt=now,
+                    Signature=national_signature
+                )
+                session.add(new_national_root)
+                
+            session.commit()
         
     def load_chain_from_db(self):
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # Signature sütunu var mı kontrol et
-        has_signature_column = True
-        try:
-            cur.execute("SELECT Signature FROM Blocks LIMIT 1")
-        except Exception:
-            has_signature_column = False
-            # Sütunu ekle
-            cur.execute("ALTER TABLE Blocks ADD COLUMN Signature TEXT")
-            conn.commit()
-        
-        if has_signature_column:
-            cur.execute("""
-                SELECT BlockIndex, PreviousHash, Timestamp,
-                       VoterID_Hashed, Candidate, Hash, Signature
-                FROM Blocks
-                WHERE Region = ?
-                ORDER BY BlockIndex
-            """, (self.region_name,))
-            rows = cur.fetchall()
+        # SQLAlchemy ile veritabanından zinciri yükle
+        with get_db_session() as session:
+            # Bölgeye ait blokları çek
+            blocks_query = select(BlockModel).where(
+                BlockModel.Region == self.region_name
+            ).order_by(BlockModel.BlockIndex.asc())
             
-            self.chain = [
-                Block(r["BlockIndex"], r["PreviousHash"], r["Timestamp"],
-                      r["VoterID_Hashed"], r["Candidate"], r["Hash"], r["Signature"])
-                for r in rows
-            ]
-        else:
-            cur.execute("""
-                SELECT BlockIndex, PreviousHash, Timestamp,
-                       VoterID_Hashed, Candidate, Hash
-                FROM Blocks
-                WHERE Region = ?
-                ORDER BY BlockIndex
-            """, (self.region_name,))
-            rows = cur.fetchall()
+            db_blocks = session.execute(blocks_query).scalars().all()
             
+            # Çekilen blokları Block nesnesine dönüştür
             self.chain = []
-            for r in rows:
-                # İmzasız bloklar için imza oluştur
-                block = Block(r["BlockIndex"], r["PreviousHash"], r["Timestamp"],
-                          r["VoterID_Hashed"], r["Candidate"], r["Hash"])
-                self.chain.append(block)
+            for block in db_blocks:
+                block_obj = Block(
+                    block.BlockIndex,
+                    block.PreviousHash,
+                    block.Timestamp,
+                    block.VoterID_Hashed,
+                    block.Candidate,
+                    block.Hash,
+                    block.Signature
+                )
+                self.chain.append(block_obj)
                 
-                # İmzayı veritabanına kaydet
-                cur.execute("""
-                    UPDATE Blocks SET Signature = ?
-                    WHERE Region = ? AND BlockIndex = ?
-                """, (block.signature, self.region_name, block.index))
+                # İmza yoksa oluştur ve güncelle
+                if not block.Signature:
+                    # İmzayı güncelle
+                    block_update = update(BlockModel).where(
+                        (BlockModel.Region == self.region_name) &
+                        (BlockModel.BlockIndex == block.BlockIndex)
+                    ).values(Signature=block_obj.signature)
+                    
+                    session.execute(block_update)
             
-            conn.commit()
-        
-        conn.close()
+            # Tüm değişiklikleri kaydet
+            session.commit()
 
     def save_block_to_db(self, block: Block):
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # Signature sütununu kontrol et ve gerekirse ekle
-        try:
-            cur.execute("SELECT Signature FROM Blocks LIMIT 1")
-        except Exception:
-            # Sütun yoksa ekle
-            cur.execute("ALTER TABLE Blocks ADD COLUMN Signature TEXT")
-            conn.commit()
-        
-        cur.execute("""
-            INSERT INTO Blocks
-              (Region, BlockIndex, PreviousHash, Timestamp,
-               VoterID_Hashed, Candidate, Hash, Signature)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            self.region_name,
-            block.index,
-            block.previous_hash,
-            block.timestamp,
-            block.voter_id_hash,
-            block.candidate,
-            block.hash,
-            block.signature
-        ))
-        conn.commit()
-        conn.close()
+        # SQLAlchemy ile bloğu veritabanına kaydet
+        with get_db_session() as session:
+            new_block = BlockModel(
+                Region=self.region_name,
+                BlockIndex=block.index,
+                PreviousHash=block.previous_hash,
+                Timestamp=block.timestamp,
+                VoterID_Hashed=block.voter_id_hash,
+                Candidate=block.candidate,
+                Hash=block.hash,
+                Signature=block.signature
+            )
+            
+            session.add(new_block)
+            session.commit()
 
     def get_chain(self) -> List[Dict]:
-        # DB'den satır bazlı okur, dict listesi döner
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # Signature sütunu var mı kontrol et
-        has_signature_column = True
-        try:
-            cur.execute("SELECT Signature FROM Blocks LIMIT 1")
-        except Exception:
-            has_signature_column = False
+        # SQLAlchemy ile veritabanından zinciri getir
+        with get_db_session() as session:
+            # Bölgeye ait blokları çek
+            blocks_query = select(BlockModel).where(
+                BlockModel.Region == self.region_name
+            ).order_by(BlockModel.BlockIndex.asc())
             
-        if has_signature_column:
-            cur.execute("""
-                SELECT BlockIndex, PreviousHash, Timestamp,
-                       VoterID_Hashed, Candidate, Hash, Signature
-                FROM Blocks
-                WHERE Region = ?
-                ORDER BY BlockIndex
-            """, (self.region_name,))
-        else:
-            cur.execute("""
-                SELECT BlockIndex, PreviousHash, Timestamp,
-                       VoterID_Hashed, Candidate, Hash
-                FROM Blocks
-                WHERE Region = ?
-                ORDER BY BlockIndex
-            """, (self.region_name,))
+            blocks = session.execute(blocks_query).scalars().all()
             
-        rows = cur.fetchall()
-        conn.close()
-
-        chain_data = []
-        for r in rows:
-            block_data = {
-                "index": r["BlockIndex"],
-                "previous_hash": r["PreviousHash"],
-                "timestamp": r["Timestamp"],
-                "voter_id_hash": r["VoterID_Hashed"],
-                "candidate": r["Candidate"],
-                "hash": r["Hash"],
-            }
-            
-            if has_signature_column:
-                block_data["signature"] = r["Signature"]
+            # Blokları dictionary formatına dönüştür
+            chain_data = []
+            for block in blocks:
+                block_data = {
+                    "index": block.BlockIndex,
+                    "previous_hash": block.PreviousHash,
+                    "timestamp": block.Timestamp,
+                    "voter_id_hash": block.VoterID_Hashed,
+                    "candidate": block.Candidate,
+                    "hash": block.Hash,
+                    "signature": block.Signature
+                }
+                chain_data.append(block_data)
                 
-            chain_data.append(block_data)
-            
-        return chain_data
+            return chain_data
 
     def verify_chain_integrity(self) -> bool:
         """Zincirdeki tüm blokların imzalarını ve hash bağlantılarını doğrular"""
@@ -585,73 +532,48 @@ class MainBlockchain:
     
     def _update_missing_signatures(self):
         """Tüm bölgelerdeki eksik imzaları kontrol eder ve tamamlar"""
-        conn = get_db_connection()
-        cur = conn.cursor()
-        
-        # Signature sütunu var mı kontrol et
-        try:
-            cur.execute("SELECT Signature FROM Blocks LIMIT 1")
-        except Exception:
-            # Sütun yoksa ekle
-            cur.execute("ALTER TABLE Blocks ADD COLUMN Signature TEXT")
-            conn.commit()
-        
-        # Her bölge için eksik imzaları tamamla
-        for region in REGIONS:
-            cur.execute("""
-                SELECT BlockIndex, Hash, Signature
-                FROM Blocks
-                WHERE Region = ?
-                ORDER BY BlockIndex
-            """, (region,))
+        with get_db_session() as session:
+            # Her bölge için eksik imzaları tamamla
+            for region in REGIONS:
+                blocks_query = select(BlockModel).where(
+                    (BlockModel.Region == region) &
+                    (BlockModel.Signature == None)
+                ).order_by(BlockModel.BlockIndex)
+                
+                blocks_without_signature = session.execute(blocks_query).scalars().all()
+                for block in blocks_without_signature:
+                    # İmza oluştur ve güncelle
+                    signature = sign_data(block.Hash)
+                    block_update = update(BlockModel).where(
+                        (BlockModel.Region == region) & 
+                        (BlockModel.BlockIndex == block.BlockIndex)
+                    ).values(Signature=signature)
+                    
+                    session.execute(block_update)
             
-            rows = cur.fetchall()
-            for row in rows:
-                # İmza yoksa oluştur ve güncelle
-                if row["Signature"] is None:
-                    signature = sign_data(row["Hash"])
-                    cur.execute("""
-                        UPDATE Blocks
-                        SET Signature = ?
-                        WHERE Region = ? AND BlockIndex = ?
-                    """, (signature, region, row["BlockIndex"]))
-        
-        # RegionRoots tablosunda Signature sütunu kontrolü
-        try:
-            cur.execute("SELECT Signature FROM RegionRoots LIMIT 1")
-        except Exception:
-            cur.execute("ALTER TABLE RegionRoots ADD COLUMN Signature TEXT")
-        
-        # Bölge köklerinin imzalarını kontrol et
-        cur.execute("SELECT Region, MerkleRoot, Signature FROM RegionRoots")
-        for row in cur.fetchall():
-            if row["Signature"] is None and row["MerkleRoot"]:
-                signature = sign_data(row["MerkleRoot"])
-                cur.execute("""
-                    UPDATE RegionRoots
-                    SET Signature = ?
-                    WHERE Region = ?
-                """, (signature, row["Region"]))
-        
-        # NationalRoots tablosunda Signature sütunu kontrolü
-        try:
-            cur.execute("SELECT Signature FROM NationalRoots LIMIT 1")
-        except Exception:
-            cur.execute("ALTER TABLE NationalRoots ADD COLUMN Signature TEXT")
-        
-        # Ulusal kökün imzasını kontrol et
-        cur.execute("SELECT MerkleRoot, Signature FROM NationalRoots WHERE Id = 0")
-        row = cur.fetchone()
-        if row and row["MerkleRoot"] and (row["Signature"] is None or not verify_signature(row["MerkleRoot"], row["Signature"])):
-            signature = sign_data(row["MerkleRoot"])
-            cur.execute("""
-                UPDATE NationalRoots
-                SET Signature = ?
-                WHERE Id = 0
-            """, (signature,))
-        
-        conn.commit()
-        conn.close()
+            # Bölge köklerinin imzalarını kontrol et
+            region_roots_query = select(RegionRoot).where(RegionRoot.Signature == None)
+            region_roots_without_signature = session.execute(region_roots_query).scalars().all()
+            
+            for region_root in region_roots_without_signature:
+                if region_root.MerkleRoot:
+                    signature = sign_data(region_root.MerkleRoot)
+                    region_root.Signature = signature
+            
+            # Ulusal kökün imzasını kontrol et
+            national_root_query = select(NationalRoot).where(
+                (NationalRoot.Id == 0) & 
+                ((NationalRoot.Signature == None) | (NationalRoot.MerkleRoot != None))
+            )
+            national_root = session.execute(national_root_query).scalar_one_or_none()
+            
+            if national_root and national_root.MerkleRoot:
+                if national_root.Signature is None or not verify_signature(national_root.MerkleRoot, national_root.Signature):
+                    signature = sign_data(national_root.MerkleRoot)
+                    national_root.Signature = signature
+            
+            # Değişiklikleri kaydet
+            session.commit()
 
     def vote(self, region: str, voter_id: str, candidate: str):
         # Debug bilgisi
@@ -689,74 +611,48 @@ class MainBlockchain:
         return results
 
     def get_merkle_structure(self) -> dict:
-        conn = get_db_connection()
-        cur  = conn.cursor()
+        with get_db_session() as session:
+            structure = {
+                "root": "Ulusal Seçim Zinciri",
+                "regions": [],
+                "stored_merkle_root": "",
+                "live_merkle_root": "",
+                "stored_signature": "",
+                "signature_valid": False,
+                "match": True
+            }
 
-        structure = {
-            "root": "Ulusal Seçim Zinciri",
-            "regions": [],
-            "stored_merkle_root": "",
-            "live_merkle_root": "",
-            "stored_signature": "",
-            "signature_valid": False,
-            "match": True
-        }
+            live_region_roots = []
 
-        live_region_roots = []
-
-        # 1️⃣ Her bölge için zinciri oku, kontrol et, live_root hesapla
-        for region in REGIONS:
-            # Signature sütununu kontrol et
-            has_signature_column = True
-            try:
-                cur.execute("SELECT Signature FROM Blocks LIMIT 1")
-            except Exception:
-                has_signature_column = False
+            # 1️⃣ Her bölge için zinciri oku, kontrol et, live_root hesapla
+            for region in REGIONS:
+                # Bölgeye ait blokları getir
+                blocks_query = select(BlockModel).where(
+                    BlockModel.Region == region
+                ).order_by(BlockModel.BlockIndex.asc())
                 
-            if has_signature_column:
-                cur.execute("""
-                    SELECT BlockIndex, PreviousHash, Timestamp,
-                           VoterID_Hashed, Candidate, Hash, Signature
-                    FROM Blocks
-                    WHERE Region = ?
-                    ORDER BY BlockIndex ASC
-                """, (region,))
-            else:
-                cur.execute("""
-                    SELECT BlockIndex, PreviousHash, Timestamp,
-                           VoterID_Hashed, Candidate, Hash
-                    FROM Blocks
-                    WHERE Region = ?
-                    ORDER BY BlockIndex ASC
-                """, (region,))
+                blocks_db = session.execute(blocks_query).scalars().all()
                 
-            rows = cur.fetchall()
-            
-            blocks = []
-            for r in rows:
-                block = {
-                    "index":        r["BlockIndex"],
-                    "previous_hash":r["PreviousHash"],
-                    "timestamp":    r["Timestamp"],
-                    "voter_id_hash":r["VoterID_Hashed"],
-                    "candidate":    r["Candidate"],
-                    "hash":         r["Hash"]
-                }
+                blocks = []
+                for block in blocks_db:
+                    block_dict = {
+                        "index": block.BlockIndex,
+                        "previous_hash": block.PreviousHash,
+                        "timestamp": block.Timestamp,
+                        "voter_id_hash": block.VoterID_Hashed,
+                        "candidate": block.Candidate,
+                        "hash": block.Hash,
+                        "signature": block.Signature
+                    }
+                    blocks.append(block_dict)
                 
-                if has_signature_column:
-                    block["signature"] = r["Signature"]
-                    
-                blocks.append(block)
+                # Blok zincirinin tutarlılığını kontrol et
+                ok = validate_chain(blocks, region)
                 
-            # Blok zincirinin tutarlılığını kontrol et
-            ok = validate_chain(blocks, region)
-            
-            # İmzaları doğrula
-            signatures_valid = True
-            if has_signature_column:
+                # İmzaları doğrula
+                signatures_valid = True
                 for block in blocks:
-                    # İmza varsa kontrol et, yoksa geç
-                    if "signature" in block and block["signature"] is not None:
+                    if block["signature"] is not None:
                         if not verify_signature(block["hash"], block["signature"]):
                             signatures_valid = False
                             ok = False
@@ -764,57 +660,50 @@ class MainBlockchain:
                     else:
                         # İmza yoksa, bu blok için imza oluştur ve kaydet
                         signature = sign_data(block["hash"])
-                        cur.execute("""
-                            UPDATE Blocks SET Signature = ?
-                            WHERE Region = ? AND BlockIndex = ?
-                        """, (signature, region, block["index"]))
-                        conn.commit()
+                        block_update = update(BlockModel).where(
+                            (BlockModel.Region == region) & 
+                            (BlockModel.BlockIndex == block["index"])
+                        ).values(Signature=signature)
+                        
+                        session.execute(block_update)
+                        session.commit()
 
-            leaf_hashes = [b["hash"] for b in blocks]
-            live_root = calculate_merkle_root(leaf_hashes)
+                leaf_hashes = [b["hash"] for b in blocks]
+                live_root = calculate_merkle_root(leaf_hashes)
 
-            region_data = {
-                "region":    region,
-                "status":    "OK" if ok else "BROKEN",
-                "blocks":    blocks,
-                "live_root": live_root
-            }
-            
-            if has_signature_column:
-                region_data["signatures_valid"] = signatures_valid
+                region_data = {
+                    "region": region,
+                    "status": "OK" if ok else "BROKEN",
+                    "blocks": blocks,
+                    "live_root": live_root,
+                    "signatures_valid": signatures_valid
+                }
                 
-            structure["regions"].append(region_data)
-            
-            if ok:
-                live_region_roots.append(live_root)
+                structure["regions"].append(region_data)
+                
+                if ok:
+                    live_region_roots.append(live_root)
 
-        # 2️⃣ Canlı ulusal kök
-        structure["live_merkle_root"] = calculate_merkle_root(live_region_roots)
+            # 2️⃣ Canlı ulusal kök
+            structure["live_merkle_root"] = calculate_merkle_root(live_region_roots)
 
-        # 3️⃣ Stored (DB'deki) ulusal kökü ve imzasını çek
-        has_signature_column = True
-        try:
-            cur.execute("SELECT MerkleRoot, Signature FROM NationalRoots WHERE Id = 0")
-            row = cur.fetchone()
-        except Exception:
-            has_signature_column = False
-            cur.execute("SELECT MerkleRoot FROM NationalRoots WHERE Id = 0")
-            row = cur.fetchone()
+            # 3️⃣ Stored (DB'deki) ulusal kökü ve imzasını çek
+            national_root_query = select(NationalRoot).where(NationalRoot.Id == 0)
+            national_root = session.execute(national_root_query).scalar_one_or_none()
             
-        if row and row["MerkleRoot"]:
-            structure["stored_merkle_root"] = row["MerkleRoot"]
-            
-            if has_signature_column and row["Signature"]:
-                structure["stored_signature"] = row["Signature"]
-                structure["signature_valid"] = verify_signature(
-                    row["MerkleRoot"], 
-                    row["Signature"]
+            if national_root and national_root.MerkleRoot:
+                structure["stored_merkle_root"] = national_root.MerkleRoot
+                
+                if national_root.Signature:
+                    structure["stored_signature"] = national_root.Signature
+                    structure["signature_valid"] = verify_signature(
+                        national_root.MerkleRoot, 
+                        national_root.Signature
+                    )
+                
+                # 4️⃣ Match durumu
+                structure["match"] = (
+                    structure["stored_merkle_root"] == structure["live_merkle_root"]
                 )
-            
-            # 4️⃣ Match durumu
-            structure["match"] = (
-                structure["stored_merkle_root"] == structure["live_merkle_root"]
-            )
 
-        conn.close()
-        return structure
+            return structure
