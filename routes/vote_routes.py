@@ -15,6 +15,8 @@ from db.crud_candidates import get_all_candidates, candidate_exists
 def cast_vote(request: VoteRequest, current_user: dict = Depends(get_current_voter)):
     tc = current_user["tc"]
     region = current_user["region"]
+    
+    print(f"DEBUG: Oy verme isteği - TC Hash: {tc[:8]}***, Bölge: {region}")
 
     if not candidate_exists(request.candidate):
         raise HTTPException(status_code=400, detail="Geçersiz aday ismi")

@@ -3,15 +3,60 @@ from jose import jwt, JWTError
 from fastapi import HTTPException, Depends
 from fastapi.security import OAuth2PasswordBearer
 from passlib.context import CryptContext
+from cryptography.fernet import Fernet
+import base64
+import hashlib
 
 # Şifreleme
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# TC Kimlik için şifreleme anahtarı
+TC_ENCRYPT_KEY = b'Vit3b_JeRFpDIiN9sNmiRNV3-xQvz6feIq85aq1zTXI='
+fernet = Fernet(TC_ENCRYPT_KEY)
 
 def hash_password(password: str):
     return pwd_context.hash(password)
 
 def verify_password(plain_password: str, hashed_password: str):
     return pwd_context.verify(plain_password, hashed_password)
+
+def encrypt_tc(tc: str) -> str:
+    """TC kimlik numarasını şifreler"""
+    tc_bytes = tc.encode()
+    encrypted_tc = fernet.encrypt(tc_bytes)
+    return base64.urlsafe_b64encode(encrypted_tc).decode()
+
+def decrypt_tc(encrypted_tc: str) -> str:
+    """Şifrelenmiş TC kimlik numarasını çözer"""
+    try:
+        encrypted_bytes = base64.urlsafe_b64decode(encrypted_tc.encode())
+        decrypted_tc = fernet.decrypt(encrypted_bytes).decode()
+        return decrypted_tc
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"TC kimlik çözülemedi: {str(e)}")
+
+def hash_tc_for_storage(tc: str) -> str:
+    """TC kimlik numarasını saklamak için hashler"""
+    # TC numarasını string olduğundan emin ol ve boşlukları temizle
+    tc_str = str(tc).strip()
+    
+    # TC numarası 11 haneli mi kontrol et (normal TC kimlik numarası ise)
+    if len(tc_str) == 11 and tc_str.isdigit():
+        print(f"DEBUG: Normal TC hash hesaplanıyor: {tc_str[:3]}***")
+        hash_value = hashlib.sha256(tc_str.encode('utf-8')).hexdigest()
+        print(f"DEBUG: Hesaplanan hash: {hash_value[:8]}***")
+        return hash_value
+    
+    # Eğer zaten hash ise (64 karakter hex ise), aynen döndür
+    if len(tc_str) == 64 and all(c in '0123456789abcdef' for c in tc_str.lower()):
+        print(f"DEBUG: Zaten hash formatında: {tc_str[:8]}***")
+        return tc_str
+    
+    # Diğer durumlar için yine hash hesapla
+    print(f"DEBUG: Bilinmeyen format, hash hesaplanıyor")
+    hash_value = hashlib.sha256(tc_str.encode('utf-8')).hexdigest()
+    print(f"DEBUG: Hesaplanan hash: {hash_value[:8]}***") 
+    return hash_value
 
 # JWT Ayarları
 SECRET_KEY = "supersecretjwtkey123456"
@@ -48,11 +93,12 @@ def get_current_voter(token: str = Depends(oauth2_scheme)):
             raise credentials_exception
             
         if role == "voter":
-            tc = sub
+            # sub artık TC hash değeri
+            tc_hash = sub
             region = payload.get("region")
             if region is None:
                 raise credentials_exception
-            return {"tc": tc, "region": region, "role": role}
+            return {"tc": tc_hash, "region": region, "role": role}
         elif role == "admin":
             username = sub
             return {"username": username, "role": role}

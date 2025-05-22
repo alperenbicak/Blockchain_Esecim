@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends
 from auth.schemas import RegisterRequest, LoginRequest, AdminLoginRequest
-from db.crud_voters import create_voter, get_voter, voter_exists, get_admin
-from auth.jwt_handler import hash_password, verify_password, create_access_token, get_current_voter, blacklist_token
+from db.crud_voters import create_voter, get_voter, voter_exists, get_admin, update_existing_voters_to_hashed
+from auth.jwt_handler import hash_password, verify_password, create_access_token, get_current_voter, blacklist_token, hash_tc_for_storage
 from fastapi.security import OAuth2PasswordRequestForm
 
 router = APIRouter()
@@ -27,16 +27,26 @@ def register_user(request: RegisterRequest):
 
 @router.post("/login")
 def login_user(request: LoginRequest):
+    # TC hash'ini hesapla - bu hash değeri veritabanında arama için kullanılacak
+    tc_hash = hash_tc_for_storage(request.tc)
+    
+    # Önce hash ile sorgulama yap
     voter = get_voter(request.tc, request.region)
 
     if not voter:
+        # Eğer bulunamazsa, direkt TC ile sorgulama yapılıyor olabilir (eski kayıtlar)
         raise HTTPException(status_code=401, detail="Hatalı TC veya bölge")
 
     db_password = voter.Password if hasattr(voter, "Password") else voter[4]  # pyodbc row objesi ise indexle
     if not verify_password(request.password, db_password):
         raise HTTPException(status_code=401, detail="Şifre hatalı")
 
-    token = create_access_token(data={"sub": request.tc, "region": request.region, "role": "voter"})
+    # Loglama amaçlı TC hash değerini yazdır
+    print(f"DEBUG: Login - TC: {request.tc[:3]}***, Hash: {tc_hash[:8]}***")
+    
+    # Token'a eklemek için hash değerini kullan
+    token = create_access_token(data={"sub": tc_hash, "region": request.region, "role": "voter"})
+    
     return {"access_token": token, "token_type": "bearer"}
 
 @router.post("/admin/login")
@@ -84,3 +94,15 @@ def logout_admin(token: str = Depends(OAuth2PasswordRequestForm), current_user: 
     blacklist_token(token)
     
     return {"message": "Başarıyla çıkış yapıldı"}
+
+@router.post("/admin/update-tc-hash")
+def update_tc_hash(current_user: dict = Depends(get_current_voter)):
+    """Mevcut tüm kullanıcıların TC kimlik numaralarını hash formatına dönüştürür"""
+    if current_user.get("role") != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Bu işlem için admin yetkisi gerekiyor"
+        )
+    
+    result = update_existing_voters_to_hashed()
+    return result

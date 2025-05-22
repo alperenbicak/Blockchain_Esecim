@@ -27,13 +27,16 @@ class Voter(Base):
     __tablename__ = 'Voters'
     
     id = Column(Integer, primary_key=True, autoincrement=True)
-    TC = Column(String(11), nullable=False, unique=True)
+    TC = Column(String(128), nullable=False, unique=True)
+    TC_Hash = Column(String(64), nullable=True)
     FullName = Column(String(50), nullable=False)
     Region = Column(String(50), nullable=False)
+    Password = Column(String(128), nullable=False)
     HasVoted = Column(Boolean, default=False)
     
     __table_args__ = (
         Index('idx_tc', 'TC'),
+        Index('idx_tc_hash', 'TC_Hash'),
         Index('idx_region', 'Region'),
     )
 
