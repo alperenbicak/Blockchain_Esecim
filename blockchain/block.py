@@ -474,6 +474,7 @@ class RegionalBlockchain:
                     block.Timestamp,
                     block.VoterID_Hashed,
                     block.Candidate,
+                    block.Hash,
                     block.Signature
                 )
                 self.chain.append(block_obj)
