@@ -72,24 +72,20 @@ def voter_exists(tc: str):
     
     # TC hash'ini hesapla
     hashed_tc = hash_tc_for_storage(tc)
-    print(f"DEBUG: voter_exists - TC: {tc[:3]}***, Hash: {hashed_tc[:8]}***")
     
     # Önce TC_Hash ile kontrol et
     cursor.execute("SELECT 1 FROM Voters WHERE TC_Hash = ?", (hashed_tc,))
     exists = cursor.fetchone()
     
     if exists:
-        print(f"DEBUG: Seçmen TC_Hash ile bulundu")
         conn.close()
         return True
     
     # Bulunamazsa, doğrudan TC ile kontrol et (eski kayıtlar için)
-    print(f"DEBUG: TC_Hash ile bulunamadı, doğrudan TC ile aranıyor")
     cursor.execute("SELECT 1 FROM Voters WHERE TC = ?", (tc,))
     exists = cursor.fetchone()
     
     if exists:
-        print(f"DEBUG: Seçmen doğrudan TC ile bulundu - Hash güncelleniyor")
         # TC_Hash alanını güncelle
         cursor.execute("UPDATE Voters SET TC_Hash = ? WHERE TC = ?", (hashed_tc, tc))
         conn.commit()
@@ -104,24 +100,20 @@ def get_voter(tc: str, region: str):
     
     # TC hash'ini hesapla
     hashed_tc = hash_tc_for_storage(tc)
-    print(f"DEBUG: get_voter - TC: {tc[:3]}***, Hash: {hashed_tc[:8]}***")
     
     # Önce TC_Hash ile sorgula
     cursor.execute("SELECT * FROM Voters WHERE TC_Hash = ? AND Region = ?", (hashed_tc, region))
     voter = cursor.fetchone()
     
     if voter:
-        print(f"DEBUG: Seçmen TC_Hash ile bulundu")
         conn.close()
         return voter
     
     # Bulunamazsa, doğrudan TC ile sorgula (eski kayıtlar için)
-    print(f"DEBUG: TC_Hash ile bulunamadı, doğrudan TC ile aranıyor")
     cursor.execute("SELECT * FROM Voters WHERE TC = ? AND Region = ?", (tc, region))
     voter = cursor.fetchone()
     
     if voter:
-        print(f"DEBUG: Seçmen doğrudan TC ile bulundu - Hash güncelleniyor")
         # TC_Hash alanını güncelle
         cursor.execute("UPDATE Voters SET TC_Hash = ? WHERE TC = ?", (hashed_tc, tc))
         conn.commit()
@@ -182,9 +174,7 @@ def update_existing_voters_to_hashed():
     # TC_Hash sütununu kontrol et, yoksa ekle
     try:
         cursor.execute("SELECT TC_Hash FROM Voters LIMIT 1")
-        print("DEBUG: TC_Hash sütunu zaten mevcut")
     except Exception:
-        print("DEBUG: TC_Hash sütunu ekleniyor")
         cursor.execute("ALTER TABLE Voters ADD COLUMN TC_Hash TEXT")
         conn.commit()
     
@@ -199,13 +189,11 @@ def update_existing_voters_to_hashed():
     for voter in voters:
         voter_id = voter[0]
         tc = voter[1]
-        print(f"DEBUG: Seçmen işleniyor - ID: {voter_id}")
         
         # Şifrelenmiş veya hash mi kontrol et
         is_hash = len(tc) == 64 and all(c in '0123456789abcdef' for c in tc.lower())
         
         if is_hash:
-            print(f"DEBUG: TC zaten hash değeri, değişiklik yapılmıyor: {tc[:8]}***")
             continue
             
         # TC'nin şifrelenmiş olup olmadığını kontrol et
@@ -213,21 +201,16 @@ def update_existing_voters_to_hashed():
             # Eğer zaten şifrelenmişse, decrypt_tc başarılı olur
             plaintext_tc = decrypt_tc(tc)
             decrypted_count += 1
-            print(f"DEBUG: Şifrelenmiş TC çözüldü: {plaintext_tc[:3]}***")
             
             # Hash'i güncelle
             hashed_tc = hash_tc_for_storage(plaintext_tc)
-            print(f"DEBUG: Hash hesaplandı: {hashed_tc[:8]}***")
             
             cursor.execute("UPDATE Voters SET TC_Hash = ? WHERE id = ?", (hashed_tc, voter_id))
             updated_count += 1
         except Exception as e:
-            print(f"DEBUG: Decrypt hatası, muhtemelen düz TC - Hata: {str(e)}")
             # Şifrelenmemiş TC - şifrele ve hashle
             hashed_tc = hash_tc_for_storage(tc)
             encrypted_tc = encrypt_tc(tc)
-            
-            print(f"DEBUG: Düz TC: {tc[:3]}***, Hash: {hashed_tc[:8]}***, Şifreli: {encrypted_tc[:10]}***")
             
             cursor.execute("""
                 UPDATE Voters 
@@ -239,7 +222,6 @@ def update_existing_voters_to_hashed():
     conn.commit()
     
     # Eski hash değerlerini düzeltmek için kayıtları gözden geçir
-    print("DEBUG: Eski hash değerlerini düzeltme kontrolü yapılıyor...")
     cursor.execute("SELECT id, TC, TC_Hash FROM Voters")
     voters = cursor.fetchall()
     
@@ -261,13 +243,10 @@ def update_existing_voters_to_hashed():
             
             # Eğer hash değeri farklıysa güncelle
             if current_hash != correct_hash:
-                print(f"DEBUG: Hash değeri düzeltiliyor - ID: {voter_id}")
-                print(f"DEBUG: Eski hash: {current_hash[:8]}***, Yeni hash: {correct_hash[:8]}***")
-                
                 cursor.execute("UPDATE Voters SET TC_Hash = ? WHERE id = ?", (correct_hash, voter_id))
                 fixed_hash_count += 1
         except Exception as e:
-            print(f"DEBUG: Hash düzeltme hatası - ID: {voter_id}, Hata: {str(e)}")
+            pass
     
     if fixed_hash_count > 0:
         conn.commit()

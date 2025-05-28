@@ -58,7 +58,6 @@ def normalize_region_name(region_name: str) -> str:
 def generate_keypair():
     """RSA anahtar çifti oluşturur ve dosyalara kaydeder"""
     if os.path.exists(PRIVATE_KEY_PATH) and os.path.exists(PUBLIC_KEY_PATH):
-        print("Anahtarlar zaten mevcut, yeniden oluşturulmadı.")
         return
 
     # 2048-bit RSA anahtar çifti oluştur
@@ -82,8 +81,6 @@ def generate_keypair():
             encoding=serialization.Encoding.PEM,
             format=serialization.PublicFormat.SubjectPublicKeyInfo
         ))
-    
-    print("RSA anahtar çifti oluşturuldu ve kaydedildi.")
 
 def load_private_key():
     """Özel anahtarı yükler"""
@@ -206,9 +203,6 @@ class RegionalBlockchain:
     def add_vote(self, voter_id: str, candidate: str):
         # SQLAlchemy ile sorguları dönüştürüyoruz
         with get_db_session() as session:
-            # Debug bilgisi: Girilen değerleri kontrol et
-            print(f"DEBUG: Oy verme işlemi başlatıldı - TC Hash: {voter_id[:8]}***, Bölge: {self.region_name}, Aday: {candidate}")
-            
             # TC numarasını hash değeri olarak değerlendirme
             tc_hash = voter_id
             
@@ -218,8 +212,6 @@ class RegionalBlockchain:
             
             # TC_Hash sütunu varsa ama kayıt bulunamadıysa, eski TC sütunu üzerinden arama yapalım
             if not voter_record:
-                print(f"DEBUG: TC_Hash '{tc_hash[:8]}***' ile seçmen bulunamadı, şifrelenmiş TC değeri üzerinden arama yapılıyor")
-                
                 # Tüm seçmenleri getir ve decrypt ile karşılaştır
                 all_voters_query = select(Voter)
                 all_voters = session.execute(all_voters_query).scalars().all()
@@ -230,7 +222,6 @@ class RegionalBlockchain:
                         # TC_Hash varsa kontrol et
                         if voter.TC_Hash and voter.TC_Hash == tc_hash:
                             voter_record = voter
-                            print(f"DEBUG: TC_Hash doğrudan eşleşti: {voter.TC_Hash[:8]}***")
                             found = True
                             break
                             
@@ -238,36 +229,29 @@ class RegionalBlockchain:
                         if voter.TC:
                             decrypted_tc = decrypt_tc(voter.TC)
                             calc_hash = hash_tc_for_storage(decrypted_tc)
-                            print(f"DEBUG: Karşılaştırma - Aranan hash: {tc_hash[:8]}***, Hesaplanan hash: {calc_hash[:8]}***")
                             
                             # TC eşleşirse kayıt edilmiş
                             if calc_hash == tc_hash:
                                 voter_record = voter
-                                print(f"DEBUG: Decrypt ile seçmen bulundu: {decrypted_tc[:3]}*** - Hash: {calc_hash[:8]}***")
                                 
                                 # TC_Hash sütununu güncelle
                                 if not voter.TC_Hash:
                                     update_stmt = update(Voter).where(Voter.id == voter.id).values(TC_Hash=tc_hash)
                                     session.execute(update_stmt)
                                     session.commit()
-                                    print(f"DEBUG: TC_Hash sütunu güncellendi")
                                 found = True
                                 break
                     except Exception as e:
                         # Decrypt hatası - büyük ihtimalle bu eski formatta bir TC
-                        print(f"DEBUG: Decrypt hatası: {str(e)}")
                         continue
                         
                 if not found:
-                    print(f"DEBUG: Hiçbir seçmen kaydı eşleşmedi. Tüm seçmenlerin TC_Hash değerleri kontrol ediliyor...")
                     # Tüm seçmenlerin TC_Hash değerlerini göster
                     for voter in all_voters:
-                        print(f"DEBUG: Seçmen ID: {voter.id}, TC_Hash: {voter.TC_Hash[:8] if voter.TC_Hash else 'None'}")
+                        pass
             
             if not voter_record:
-                raise ValueError(f"Seçmen kaydı bulunamadı! TC Hash: {tc_hash[:8]}***")
-            
-            print(f"DEBUG: Seçmen kaydı bulundu. Kayıtlı bölge: {voter_record.Region}, Mevcut bölge: {self.region_name}")
+                raise ValueError("Seçmen kaydı bulunamadı! Lütfen kayıt durumunuzu kontrol edin.")
             
             # Şimdi bölge eşleşmesini kontrol et
             region_match_query = select(Voter).where(
@@ -280,51 +264,41 @@ class RegionalBlockchain:
             
             if not row:
                 # Bölge adı normalizasyonunu dene
-                print(f"DEBUG: Doğrudan bölge eşleşmesi yok. Normalizasyon deneniyor.")
                 normalized_region = normalize_region_name(self.region_name)
-                print(f"DEBUG: Normalize edilmiş bölge: {normalized_region}")
                 
                 # Ayrıca kullanıcının bölgesini de normalize et
                 voter_region = voter_record.Region
                 voter_normalized_region = normalize_region_name(voter_region)
-                print(f"DEBUG: Kullanıcı bölgesi normalize: {voter_normalized_region}")
                 
                 # Kontrol 1: Mevcut bölge adının normalize hali ile seçmenin kayıtlı olduğu bölge adını karşılaştır
                 if normalized_region == voter_region:
-                    print(f"DEBUG: Normalize edilmiş bölge adı, seçmenin bölgesiyle eşleşti: {normalized_region} == {voter_region}")
                     self.region_name = voter_region
                     row = voter_record
                 
                 # Kontrol 2: Seçmenin bölge adının normalize hali ile mevcut bölge adını karşılaştır
                 elif voter_normalized_region == self.region_name:
-                    print(f"DEBUG: Normalize edilmiş seçmen bölgesi, mevcut bölgeyle eşleşti: {voter_normalized_region} == {self.region_name}")
                     row = voter_record
                 
                 # Kontrol 3: Her iki bölge adının normalize halleri karşılaştır
                 elif normalized_region == voter_normalized_region:
-                    print(f"DEBUG: Her iki bölgenin normalize halleri eşleşti: {normalized_region} == {voter_normalized_region}")
                     self.region_name = normalized_region  # En tutarlı hali kullan
                     row = voter_record
                     
                     # Veritabanındaki bölge adını da düzeltmeyi dene
                     try:
-                        print(f"DEBUG: Veritabanındaki bölge adını düzeltme deneniyor: {voter_region} -> {normalized_region}")
                         update_stmt = update(Voter).where(
                             (Voter.TC_Hash == tc_hash) & (Voter.Region == voter_region)
                         ).values(Region=normalized_region)
                         
                         session.execute(update_stmt)
                         session.commit()
-                        print("DEBUG: Veritabanındaki bölge adı güncellendi.")
                         actual_voter_region = normalized_region  # Güncellenmiş bölge adını kullan
                     except Exception as e:
-                        print(f"DEBUG: Veritabanı güncelleme hatası: {str(e)}")
                         # Hata durumunda işleme devam edebiliriz, veritabanı güncellemek kritik değil
                         pass
                         
                 # Eğer normalizasyonla hala eşleşme sağlanamazsa, mevcut bölge adını kullanıcının bölgesiyle değiştirmeyi dene
                 elif not row:
-                    print(f"DEBUG: Son çare olarak kullanıcının bölgesi kullanılıyor: {voter_region}")
                     self.region_name = voter_region
                     voter_in_region_query = select(Voter).where(
                         (Voter.TC_Hash == tc_hash) & (Voter.Region == voter_region)
@@ -337,7 +311,7 @@ class RegionalBlockchain:
             
             # Seçmenin daha önce oy kullanıp kullanmadığını kontrol et
             if row.HasVoted:
-                raise ValueError(f"Bu seçmen zaten oy kullandı! TC Hash: {tc_hash[:8]}***")
+                raise ValueError("Bu seçmen daha önce oy kullanmış. Bir seçmen sadece bir kez oy kullanabilir.")
 
             # Blok oluşturma & DB'ye kaydetme
             # Voter_id değerini TC Hash olarak kullan
@@ -356,8 +330,6 @@ class RegionalBlockchain:
             self.save_block_to_db(block)
 
             # Seçmeni işaretle - ÖNEMLİ: Burada actual_voter_region kullanarak doğru bölgeyi güncelliyoruz
-            print(f"DEBUG: Seçmen oy kullandı olarak işaretleniyor. TC Hash: {tc_hash[:8]}***, Bölge: {actual_voter_region}")
-            
             update_stmt = update(Voter).where(
                 (Voter.TC_Hash == tc_hash) & (Voter.Region == actual_voter_region)
             ).values(HasVoted=True)
@@ -367,12 +339,9 @@ class RegionalBlockchain:
             
             # İşlem başarılı mı kontrol et
             if result.rowcount <= 0:
-                print(f"UYARI: HasVoted güncellemesi başarısız olmuş olabilir! Etkilenen satır sayısı: {result.rowcount}")
-                
                 # REGIONS içindeki tam eşleşen bölgeyi aramayı da dene
                 for region in REGIONS:
                     if normalize_region_name(region) == normalize_region_name(actual_voter_region):
-                        print(f"DEBUG: İkinci deneme: Standart bölge adı '{region}' ile güncelleme deneniyor")
                         update_stmt = update(Voter).where(
                             (Voter.TC_Hash == tc_hash) & (Voter.Region == region)
                         ).values(HasVoted=True)
@@ -381,10 +350,9 @@ class RegionalBlockchain:
                         session.commit()
                         
                         if result.rowcount > 0:
-                            print(f"DEBUG: İkinci deneme başarılı! Bölge '{region}' ile güncellendi.")
                             break
             else:
-                print(f"DEBUG: HasVoted başarıyla güncellendi! Etkilenen satır sayısı: {result.rowcount}")
+                pass
 
             # --- Bölge Merkle Root güncelle ---
             blocks_query = select(BlockModel.Hash).where(
@@ -536,38 +504,37 @@ class RegionalBlockchain:
             return chain_data
 
     def verify_chain_integrity(self) -> bool:
-        """Zincirdeki tüm blokların imzalarını ve hash bağlantılarını doğrular"""
-        if not self.chain:
-            return True  # Boş zincir geçerli kabul edilir
+        """Bölgesel zincirin bütünlüğünü doğrular"""
+        if len(self.chain) == 0:
+            return False
+            
+        # Genesis bloğunu kontrol et
+        if self.chain[0].index != 0 or self.chain[0].previous_hash != "0":
+            return False
             
         for i, block in enumerate(self.chain):
-            # İmzayı doğrula
+            # İmza doğrulaması
             if not block.verify():
-                print(f"Blok {block.index} için imza doğrulaması başarısız oldu!")
                 return False
                 
-            # Genesis bloğu için özel kontrol
+            # Genesis bloğu
             if i == 0:
-                if block.previous_hash != "0" or block.index != 0:
-                    print("Genesis bloğu hatalı!")
+                if block.voter_id_hash != "Genesis" or block.candidate != "Genesis":
                     return False
                 continue
                 
-            # Diğer bloklar için zincir bağlantısını kontrol et
-            prev_block = self.chain[i-1]
-            if block.previous_hash != prev_block.hash:
-                print(f"Blok {block.index} için zincir bağlantısı hatalı!")
+            # Önceki bloğun hash'i eşleşiyor mu
+            if block.previous_hash != self.chain[i-1].hash:
                 return False
                 
-            # Hash değerini yeniden hesapla ve karşılaştır
+            # Hash doğru hesaplanmış mı
             expected_hash = self.calculate_hash(
-                block.index, 
-                block.previous_hash, 
-                block.voter_id_hash, 
+                block.index,
+                block.previous_hash,
+                block.voter_id_hash,
                 block.candidate
             )
             if expected_hash != block.hash:
-                print(f"Blok {block.index} için hash değeri hatalı!")
                 return False
                 
         return True
@@ -629,34 +596,24 @@ class MainBlockchain:
             session.commit()
 
     def vote(self, region: str, voter_id: str, candidate: str):
-        # Debug bilgisi
-        print(f"DEBUG: MainBlockchain.vote çağrıldı - Region: {region}")
-        print(f"DEBUG: TC Hash: {voter_id[:8]}*** (token'dan alındı)")
-        
         # Gelen voter_id zaten hash'lenmiş olduğu için tekrar hash'leme işlemi yapmıyoruz!
         voter_id_hash = voter_id
-        print(f"DEBUG: TC hash değeri (kullanılacak): {voter_id_hash[:8]}***")
         
         # Bölge adını normalize et
         normalized_region = normalize_region_name(region)
-        print(f"DEBUG: Normalize edilmiş bölge: {normalized_region}")
         
         # Normalize edilmiş bölge adını REGIONS listesinde kontrol et
         if normalized_region not in REGIONS:
             # Tüm geçerli bölge adlarını göster
             valid_regions = ", ".join(REGIONS)
-            print(f"DEBUG: Normalize edilmiş bölge ({normalized_region}) REGIONS listesinde bulunamadı!")
-            print(f"DEBUG: Geçerli bölgeler: {valid_regions}")
             
             # Hala eşleşme yoksa, doğrudan girilen bölge adını kullan
             try:
-                print(f"DEBUG: Bölge olarak doğrudan '{region}' kullanılacak")
                 self.regions[region].add_vote(voter_id_hash, candidate)
             except KeyError:
                 raise ValueError(f"Geçersiz bölge adı: '{region}'. Geçerli bölgeler: {valid_regions}")
         else:
             # Normalize edilmiş bölge adını kullan
-            print(f"DEBUG: '{region}' normalize edildi: '{normalized_region}'. Bu bölge kullanılıyor.")
             self.regions[normalized_region].add_vote(voter_id_hash, candidate)
 
     def get_all_chains(self) -> Dict:

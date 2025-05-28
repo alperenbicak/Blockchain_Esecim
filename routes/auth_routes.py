@@ -41,9 +41,6 @@ def login_user(request: LoginRequest):
     if not verify_password(request.password, db_password):
         raise HTTPException(status_code=401, detail="Şifre hatalı")
 
-    # Loglama amaçlı TC hash değerini yazdır
-    print(f"DEBUG: Login - TC: {request.tc[:3]}***, Hash: {tc_hash[:8]}***")
-    
     # Token'a eklemek için hash değerini kullan
     token = create_access_token(data={"sub": tc_hash, "region": request.region, "role": "voter"})
     

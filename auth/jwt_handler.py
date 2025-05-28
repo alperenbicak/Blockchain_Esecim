@@ -42,20 +42,15 @@ def hash_tc_for_storage(tc: str) -> str:
     
     # TC numarası 11 haneli mi kontrol et (normal TC kimlik numarası ise)
     if len(tc_str) == 11 and tc_str.isdigit():
-        print(f"DEBUG: Normal TC hash hesaplanıyor: {tc_str[:3]}***")
         hash_value = hashlib.sha256(tc_str.encode('utf-8')).hexdigest()
-        print(f"DEBUG: Hesaplanan hash: {hash_value[:8]}***")
         return hash_value
     
     # Eğer zaten hash ise (64 karakter hex ise), aynen döndür
     if len(tc_str) == 64 and all(c in '0123456789abcdef' for c in tc_str.lower()):
-        print(f"DEBUG: Zaten hash formatında: {tc_str[:8]}***")
         return tc_str
     
     # Diğer durumlar için yine hash hesapla
-    print(f"DEBUG: Bilinmeyen format, hash hesaplanıyor")
     hash_value = hashlib.sha256(tc_str.encode('utf-8')).hexdigest()
-    print(f"DEBUG: Hesaplanan hash: {hash_value[:8]}***") 
     return hash_value
 
 # JWT Ayarları
